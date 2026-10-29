@@ -1,5 +1,6 @@
 /*
 Copyright 2022 NCC Group
+Modified in the soffensive/jwt-reauth fork (2026): initialize independent session profiles and their UI.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -31,6 +32,8 @@ public class JWTReauth implements IBurpExtender {
     private SettingsController settingsController;
     private TokenListenerStatePanel tokenListenerStatePanel;
     private TokenListener tokenListener;
+    private SessionProfiles sessionProfiles;
+    private com.nccgroup.jwtreauth.ui.SessionProfilesPanel sessionProfilesPanel;
     private MainViewController mainViewController;
 
     @Override
@@ -43,6 +46,9 @@ public class JWTReauth implements IBurpExtender {
         tokenListenerStatePanel = tokenListener.getTokenListenerStatePanel();
         settingsController = new SettingsController(this);
         tokenListener.setSettingsController(settingsController);
+        sessionProfiles = new SessionProfiles(this);
+        sessionProfilesPanel = new com.nccgroup.jwtreauth.ui.SessionProfilesPanel(this);
+        callbacks.registerExtensionStateListener(sessionProfiles);
         mainViewController = new MainViewController(this);
 
         callbacks.setExtensionName("JWT re-auth");
@@ -56,6 +62,9 @@ public class JWTReauth implements IBurpExtender {
             callbacks.printOutput("Loaded JWT re-auth. v" + VERSION);
         });
     }
+
+    public SessionProfiles getSessionProfiles() { return sessionProfiles; }
+    public com.nccgroup.jwtreauth.ui.SessionProfilesPanel getSessionProfilesPanel() { return sessionProfilesPanel; }
 
     public IBurpExtenderCallbacks getCallbacks() {
         return callbacks;

@@ -1,5 +1,6 @@
 /*
 Copyright 2022 NCC Group
+Modified in the soffensive/jwt-reauth fork (2026): import captured requests into session profiles.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -26,11 +27,13 @@ import java.util.List;
 
 public class JWTReauthContextMenuFactory implements IContextMenuFactory {
     final IExtensionHelpers helpers;
+    private final JWTReauth extension;
     final ScopeController scopeController;
     final TokenListener tokenListener;
     final LogController logController;
 
     public JWTReauthContextMenuFactory(JWTReauth jwtReauth) {
+        extension = jwtReauth;
         helpers = jwtReauth.getCallbacks().getHelpers();
         scopeController = jwtReauth.getScopeController();
         tokenListener = jwtReauth.getTokenListener();
@@ -49,6 +52,13 @@ public class JWTReauthContextMenuFactory implements IContextMenuFactory {
             case IContextMenuInvocation.CONTEXT_TARGET_SITE_MAP_TABLE:
             case IContextMenuInvocation.CONTEXT_MESSAGE_EDITOR_RESPONSE:
             case IContextMenuInvocation.CONTEXT_MESSAGE_VIEWER_RESPONSE:
+                var profileItem = new JMenuItem("Send to JWT re-auth (create session profile)");
+                profileItem.addActionListener(event -> {
+                    var messages = invocation.getSelectedMessages();
+                    if (messages != null && messages.length == 1)
+                        extension.getSessionProfilesPanel().importRequest(messages[0]);
+                });
+                menuItems.add(profileItem);
                 menuItems.add(createAuthMenuItem(invocation));
                 menuItems.add(createTokenMenuItem(invocation));
                 menuItems.add(createScopeMenuItem(invocation));

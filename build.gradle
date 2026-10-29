@@ -1,3 +1,5 @@
+// Modified in the soffensive/jwt-reauth fork (2026): add session-profile checks,
+// bundle runtime dependencies, and package project and third-party license notices.
 plugins {
     id 'java'
 }
@@ -10,11 +12,14 @@ repositories {
 }
 
 dependencies {
-    implementation 'net.portswigger.burp.extender:burp-extender-api:2.3'
+    compileOnly 'net.portswigger.burp.extender:burp-extender-api:2.3'
+    implementation 'com.google.code.gson:gson:2.10.1'
+    testImplementation 'net.portswigger.burp.extender:burp-extender-api:2.3'
     implementation 'javax.validation:validation-api:2.0.1.Final'
 }
 
 sourceSets {
+    test { java { srcDirs = ['tests'] } }
     main {
         java {
             srcDirs = ['src']
@@ -23,5 +28,29 @@ sourceSets {
 }
 
 tasks.withType(Jar) {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from(files('LICENSE.txt', 'NOTICE', 'THIRD_PARTY_NOTICES.md')) {
+        into 'META-INF'
+    }
+    from('licenses') {
+        into 'META-INF/licenses'
+    }
+    from { configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) } }
     destinationDirectory = file("$rootDir/releases")
 }
+
+// These assertion-based checks run without a test framework or network services.
+tasks.register('templateChecks', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.nccgroup.jwtreauth.ReauthTemplateTest'
+    enableAssertions = true
+}
+tasks.register('profileChecks', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.nccgroup.jwtreauth.SessionProfilesTest'
+    enableAssertions = true
+    systemProperty 'java.awt.headless', 'true'
+}
+check.dependsOn templateChecks, profileChecks

@@ -1,5 +1,6 @@
 /*
 Copyright 2022 NCC Group
+Modified in the soffensive/jwt-reauth fork (2026): route session profiles and support custom renewal templates.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -54,7 +55,9 @@ public class TokenListener implements IHttpListener, IExtensionStateListener {
     private final TokenListenerStatePanel tokenListenerStatePanel;
 
     private SettingsController settingsController;
+    private final JWTReauth extension;
 
+    private volatile ReauthTemplate reauthTemplate;
     private URL authorizeURL;
     private String headerName;
     private String headerValuePrefix;
@@ -66,6 +69,7 @@ public class TokenListener implements IHttpListener, IExtensionStateListener {
     private Optional<IHttpRequestResponse> authorizeRequest;
 
     public TokenListener(JWTReauth jwtReauth) {
+        extension = jwtReauth;
         callbacks = jwtReauth.getCallbacks();
         helpers = callbacks.getHelpers();
         logController = jwtReauth.getLogController();
@@ -99,6 +103,7 @@ public class TokenListener implements IHttpListener, IExtensionStateListener {
 
     @Override
     public void processHttpMessage(int toolFlag, boolean messageIsRequest, IHttpRequestResponse currentRequest) {
+        if (extension.getSessionProfiles() != null && extension.getSessionProfiles().process(messageIsRequest, currentRequest)) return;
         // if we aren't listening, return immediately
         if (!isListening) return;
 
@@ -148,6 +153,13 @@ public class TokenListener implements IHttpListener, IExtensionStateListener {
      * @param currentRequest the current request to the auth URL
      */
     public void processAuthResponse(@NotNull IHttpRequestResponse currentRequest, boolean fromContextMenu) {
+        if (currentRequest.getResponse() == null) {
+            logController.info("Authentication request has no response.");
+            return;
+        }
+        ReauthTemplate template = reauthTemplate;
+        if (template != null) template.extract(helpers.bytesToString(currentRequest.getResponse()));
+
         // if the current token is being set from the context menu then it overrides the manual one
         if (fromContextMenu) {
             tokenSetManually = false;
@@ -207,7 +219,16 @@ public class TokenListener implements IHttpListener, IExtensionStateListener {
     private void refreshToken() {
         IHttpRequestResponse resp = null;
         try {
-            if (this.authorizeRequest.isPresent()) {
+            ReauthTemplate template = reauthTemplate;
+            if (template != null) {
+                byte[] raw = helpers.stringToBytes(template.render());
+                var info = helpers.analyzeRequest(raw);
+                byte[] request = helpers.buildHttpMessage(info.getHeaders(),
+                        Arrays.copyOfRange(raw, info.getBodyOffset(), raw.length));
+                int port = authorizeURL.getPort() < 0 ? authorizeURL.getDefaultPort() : authorizeURL.getPort();
+                resp = callbacks.makeHttpRequest(helpers.buildHttpService(
+                        authorizeURL.getHost(), port, authorizeURL.getProtocol()), request);
+            } else if (this.authorizeRequest.isPresent()) {
                 var req = this.authorizeRequest.get();
 
                 // the listener will automatically pick up on the response and parse the token
@@ -220,7 +241,7 @@ public class TokenListener implements IHttpListener, IExtensionStateListener {
 
                 var service = helpers.buildHttpService(
                         this.authorizeURL.getHost(),
-                        this.authorizeURL.getPort(),
+                        this.authorizeURL.getPort() < 0 ? this.authorizeURL.getDefaultPort() : this.authorizeURL.getPort(),
                         this.authorizeURL.getProtocol()
                 );
 
@@ -238,7 +259,7 @@ public class TokenListener implements IHttpListener, IExtensionStateListener {
         }
 
         // if we are already listening then it will get processed with the rest of the tokens
-        if (resp != null && !isListening) {
+        if (resp != null && (!isListening || reauthTemplate != null)) {
             processAuthResponse(resp);
         }
     }
@@ -276,6 +297,7 @@ public class TokenListener implements IHttpListener, IExtensionStateListener {
 
         // invalidate the request
         this.authorizeRequest = Optional.empty();
+        this.reauthTemplate = null;
 
         // invalidate the token
         this.invalidateCachedToken();
@@ -404,6 +426,13 @@ public class TokenListener implements IHttpListener, IExtensionStateListener {
      * Note: always updates the GUI
      * attempts to request a token from the authorization URL
      */
+    public void setReauthTemplate(ReauthTemplate template) {
+        invalidateCachedRequest();
+        tokenSetManually = false;
+        reauthTemplate = template;
+        scheduleTokenRefresh();
+    }
+
     public void setAuthorizeRequest(IHttpRequestResponse authorizeRequest) {
         // note: we always invalidate the cache here because the request
         //       may have the same URL but different parameters.
@@ -415,6 +444,7 @@ public class TokenListener implements IHttpListener, IExtensionStateListener {
         // setting the authentication request overrides a manual token
         this.tokenSetManually = false;
         this.authorizeRequest = Optional.of(authorizeRequest);
+        settingsController.updateRow("authRequest", helpers.bytesToString(authorizeRequest.getRequest()));
 
         logController.debug("Set new Authorization Requst.");
 

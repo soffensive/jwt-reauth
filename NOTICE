@@ -1,0 +1,17 @@
+JWT Re-auth
+
+Based on NCC Group's JWT Re-auth:
+https://github.com/nccgroup/jwt-reauth
+Copyright 2022 NCC Group
+Original contributors: Sam Leonard and James Briggs (see CONTRIBUTORS.md).
+
+This distribution is a modified fork maintained at:
+https://github.com/soffensive/jwt-reauth
+
+Changes in this fork (2026) include custom re-authentication HTTP templates,
+response extraction, independent concurrent session profiles, a Sessions UI,
+automated checks, and packaging of runtime dependencies and license notices.
+NCC Group does not endorse this fork.
+
+Bundled third-party components and their license texts are identified in
+THIRD_PARTY_NOTICES.md and licenses/ (META-INF/ and META-INF/licenses/ in the JAR).

@@ -1,5 +1,6 @@
 /*
 Copyright 2022 NCC Group
+Modified in the soffensive/jwt-reauth fork (2026): edit custom renewal requests and validate extraction rules.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -15,6 +16,7 @@ package com.nccgroup.jwtreauth.ui.settings;
 
 import com.nccgroup.jwtreauth.JWTReauth;
 import com.nccgroup.jwtreauth.TokenListener;
+import com.nccgroup.jwtreauth.ReauthTemplate;
 import com.nccgroup.jwtreauth.ui.base.GridColumnPanel;
 import com.nccgroup.jwtreauth.ui.logging.LogController;
 import com.nccgroup.jwtreauth.ui.logging.LogLevel;
@@ -83,6 +85,37 @@ public class SettingsViewPanel extends GridColumnPanel {
                 })
                 .build();
         addRow(authRow);
+
+        var requestEditor = new JTextArea(12, 75);
+        requestEditor.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+        var extractors = new JTextArea(4, 75);
+        var initialValues = new JTextArea(4, 75);
+        updateHandlers.put("authRequest", value -> SwingUtilities.invokeLater(
+                () -> requestEditor.setText((String) value)));
+        var editRequest = new JButton("Edit custom request / response variables...");
+        editRequest.addActionListener(event -> {
+            var editor = new JPanel();
+            editor.setLayout(new BoxLayout(editor, BoxLayout.Y_AXIS));
+            editor.add(new JLabel("Raw HTTP request (target service uses Authorization URL; placeholders: ${name}):"));
+            editor.add(new JScrollPane(requestEditor));
+            editor.add(new JLabel("Response extractors: name=regex (first capture group; searches headers and body)"));
+            editor.add(new JScrollPane(extractors));
+            editor.add(new JLabel("Initial variable values: name=value (required for each placeholder)"));
+            editor.add(new JScrollPane(initialValues));
+            editor.add(new JLabel("Values are inserted literally. Encode them as required by your request. Blank request restores URL GET."));
+            while (JOptionPane.showConfirmDialog(this, editor, "Custom re-authentication request",
+                    JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE) == JOptionPane.OK_OPTION) {
+                try {
+                    ReauthTemplate template = requestEditor.getText().isBlank() ? null :
+                            new ReauthTemplate(requestEditor.getText(), extractors.getText(), initialValues.getText());
+                    tokenListener.setReauthTemplate(template);
+                    break;
+                } catch (IllegalArgumentException ex) {
+                    JOptionPane.showMessageDialog(this, ex.getMessage(), "Invalid configuration", JOptionPane.ERROR_MESSAGE);
+                }
+            }
+        });
+        addRow(new JLabel("Custom re-authentication: "), editRequest);
 
         // Create the auth request delay row
         var delayLabel = new JLabel("Authorization Request Delay (seconds): ");
@@ -171,6 +204,11 @@ public class SettingsViewPanel extends GridColumnPanel {
                         return;
                     }
 
+                    if (tokenPattern.matcher("").groupCount() < 1) {
+                        status.setStatus(StatusLabel.Status.ERROR);
+                        logController.error("Token regex needs a capture group.");
+                        return;
+                    }
                     status.setStatus(StatusLabel.Status.OK);
                     tokenListener.setTokenPattern(tokenPattern);
 
