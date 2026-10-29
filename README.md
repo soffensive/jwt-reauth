@@ -17,13 +17,15 @@ include the wrapper JAR, so use an installed Gradle rather than `./gradlew`.
 
 1. In **Sessions**, click **New profile**, or right-click a captured request and
    choose **Send to JWT re-auth (create session profile)**.
-2. Set a name, renewal URL, scope URL, and renewal interval. Edit the renewal
-   request in Burp's HTTP editor. Scope matches the URL's scheme, host, port, and
-   path subtree: `/api` includes `/api/users`, but not `/apievil`.
+2. Set a name, renewal URL, interval, and **Match requests by**: **Scope** or
+   **Marker**. Edit the renewal request in Burp's HTTP editor. The overview shows
+   the matching mode and exact rule for each profile.
 3. Add extractors, supply any initial values needed for the first renewal, and
    click **Save and test**.
-4. Enable **Renew and inject automatically** to renew on schedule and inject
-   credentials. Injection starts after a successful renewal.
+4. Check **Active** for the profile directly in the Sessions overview to start
+   renewal and credential injection. Uncheck it to stop both. New profiles start
+   inactive; **Save and test** or **Renew now** can test them without activation.
+   Token values are retained when toggling; injection requires a successful renewal.
 
 The **HTTP protocol** setting defaults to automatic selection using Burp's
 settings and the request version. Select **HTTP/1** or **HTTP/2** to override it.
@@ -55,26 +57,31 @@ A successful renewal must return HTTP 2xx and every configured extracted value.
 Failed renewals retain the previous values and retry at the next interval.
 Profiles renew independently, without overlapping their own requests.
 
-## Selecting a session
+## Selecting requests to modify
 
-For multiple accounts on the same application, add a profile marker:
+Each profile uses one mode, shown in the overview's **Match by** and **Requests
+modified** columns:
 
-```http
-X-Reauth-Profile: alice
-```
+- **Scope:** modifies unmarked requests under the configured scope URL. Matching
+  includes scheme, host, port, and path subtree: `/api` includes `/api/users`,
+  but not `/apievil`. Exactly one active Scope profile must match.
+- **Marker:** modifies requests containing the profile's marker, for example
+  `X-Reauth-Profile: alice`. Requests must also fall within its **Allowed URLs**.
+  The overview shows both the marker and this URL restriction.
 
-The extension removes the marker before forwarding. The named profile must be
-enabled and match the request's scope.
-
-Alternatively, enable **Select by scope without a marker**. Exactly one enabled
-profile must match; ambiguous matches and unknown markers inject no credentials.
+The extension strips marker headers before forwarding. Unknown markers,
+conflicting matches, and markers naming a Scope profile inject no credentials.
 Accounts are not inferred from existing browser cookies.
 
 ## Debugging
 
-The **Debugging** tab shows routing decisions, renewal responses, and request
-changes in Burp's standard before/after viewers. **Current tokens and variables**
-shows live credential values in plain text.
+The **Tokens** tab shows current tokens and variables for all profiles in plain
+text. It updates independently of debug history.
+
+The **Debugging** tab shows routing decisions and request changes. Ordinary
+requests use Burp's standard before/after viewers; renewal events show the renewal
+request and response instead, including failed responses. Select an event to
+inspect its exchange and details.
 
 Filter events, disable **Follow latest** to inspect an older request, or use
 **Clear history**. History holds 200 events, with each message/detail view limited

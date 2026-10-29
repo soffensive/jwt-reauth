@@ -28,10 +28,20 @@ import javax.swing.filechooser.FileNameExtensionFilter;
 public final class SessionProfilesPanel extends JPanel implements IExtensionStateListener {
     private final JWTReauth extension;
     private final SessionProfiles profiles;
-    private final DefaultTableModel model = new DefaultTableModel(new String[]{"Profile", "Enabled", "Scope", "Status", "Last success", "Next renewal"}, 0) {
-        @Override public boolean isCellEditable(int row, int column) { return false; }
+    private final DefaultTableModel model = new DefaultTableModel(new String[]{"Profile", "Active", "Match by", "Requests modified", "Status", "Last success", "Next renewal"}, 0) {
+        @Override public Class<?> getColumnClass(int column) { return column == 1 ? Boolean.class : String.class; }
+        @Override public boolean isCellEditable(int row, int column) { return column == 1; }
+        @Override public void setValueAt(Object value, int row, int column) {
+            if (column == 1 && row >= 0 && row < rows.size()) profiles.setEnabled(rows.get(row).name, Boolean.TRUE.equals(value));
+            super.setValueAt(value, row, column);
+        }
     };
-    private final JTable table = new JTable(model);
+    private final JTable table = new JTable(model) {
+        @Override public String getToolTipText(java.awt.event.MouseEvent event) {
+            int row = rowAtPoint(event.getPoint()), column = columnAtPoint(event.getPoint());
+            return row < 0 || column < 0 ? null : String.valueOf(getValueAt(row, column));
+        }
+    };
     private final Timer timer;
     private final JButton saveFile = new JButton("Save profiles...");
     private final JButton loadFile = new JButton("Load profiles...");
@@ -40,13 +50,13 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
     public SessionProfilesPanel(JWTReauth extension) {
         super(new BorderLayout(8, 8)); this.extension = extension; profiles = extension.getSessionProfiles();
         setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8));
-        add(new JLabel("Each profile renews independently. Select with X-Reauth-Profile: name, or enable automatic scope matching."), BorderLayout.NORTH);
+        add(new JLabel("Active profiles modify requests using exactly one matching mode: Scope or Marker. Hover over a rule to see its full value."), BorderLayout.NORTH);
         table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         add(new JScrollPane(table), BorderLayout.CENTER);
         JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT));
         JButton create = new JButton("New profile"); create.addActionListener(e -> edit(null, null)); actions.add(create);
         JButton edit = new JButton("Edit selected"); edit.addActionListener(e -> { SessionProfile p = selected(); if (p != null) edit(p, null); }); actions.add(edit);
-        JButton test = new JButton("Test / renew selected"); test.addActionListener(e -> { SessionProfile p = selected(); if (p != null) profiles.test(p.name); }); actions.add(test);
+        JButton test = new JButton("Renew now"); test.addActionListener(e -> { SessionProfile p = selected(); if (p != null) profiles.test(p.name); }); actions.add(test);
         JButton remove = new JButton("Delete selected"); remove.addActionListener(e -> { SessionProfile p = selected(); if (p != null) { profiles.remove(p.name); refresh(); } }); actions.add(remove);
         saveFile.addActionListener(e -> saveToFile()); actions.add(saveFile);
         loadFile.addActionListener(e -> loadFromFile()); actions.add(loadFile);
@@ -61,8 +71,10 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
     private void refresh() {
         SessionProfile selected = selected(); rows = profiles.list(); model.setRowCount(0);
         for (SessionProfile p : rows) {
-            model.addRow(new Object[]{p.name, p.enabled, p.scope.toString(), p.status,
-                    p.lastSuccess == null ? "Never" : p.lastSuccess.toString(), p.nextRenewal == null ? "Manual" : p.nextRenewal.toString()});
+            model.addRow(new Object[]{p.name, p.enabled, p.autoMatch ? "Scope" : "Marker",
+                    p.autoMatch ? "URLs under " + p.scope : SessionProfiles.MARKER + ": " + p.name + " (only under " + p.scope + ")",
+                    p.enabled ? p.status : "Inactive — " + p.status,
+                    p.lastSuccess == null ? "Never" : p.lastSuccess.toString(), p.nextRenewal == null ? "—" : p.nextRenewal.toString()});
             if (selected != null && selected.name.equals(p.name)) table.setRowSelectionInterval(model.getRowCount() - 1, model.getRowCount() - 1);
         }
     }
@@ -129,14 +141,31 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
         JSpinner interval = new JSpinner(new SpinnerNumberModel(existing == null ? 300 : existing.interval, 5, 86400, 5));
         JComboBox<ReauthHttpClient.Protocol> protocol = new JComboBox<>(ReauthHttpClient.Protocol.values());
         protocol.setSelectedItem(existing == null ? ReauthHttpClient.Protocol.AUTO : existing.protocol);
-        JCheckBox enabled = new JCheckBox("Renew and inject automatically", existing != null && existing.enabled);
-        JCheckBox auto = new JCheckBox("Select by scope without a marker", existing != null && existing.autoMatch);
+        JComboBox<String> matchBy = new JComboBox<>(new String[]{"Scope", "Marker"});
+        matchBy.setSelectedItem(existing != null && existing.autoMatch ? "Scope" : "Marker");
+        JLabel scopeLabel = new JLabel();
+        JTextField marker = new JTextField(); marker.setEditable(false);
+        Runnable updateRule = () -> {
+            boolean byScope = "Scope".equals(matchBy.getSelectedItem());
+            scopeLabel.setText(byScope ? "Scope URL (requests to modify)" : "Allowed URLs (marker restriction)");
+            marker.setText(SessionProfiles.MARKER + ": " + name.getText().trim());
+            marker.setEnabled(!byScope);
+        };
+        matchBy.addActionListener(e -> updateRule.run());
+        name.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+            public void insertUpdate(javax.swing.event.DocumentEvent e) { updateRule.run(); }
+            public void removeUpdate(javax.swing.event.DocumentEvent e) { updateRule.run(); }
+            public void changedUpdate(javax.swing.event.DocumentEvent e) { updateRule.run(); }
+        });
+        updateRule.run();
         fields.add(new JLabel("Profile name (e.g. alice)")); fields.add(name);
         fields.add(new JLabel("Renewal URL (destination service)")); fields.add(endpoint);
-        fields.add(new JLabel("Scope URL (origin and path subtree)")); fields.add(scope);
+        fields.add(new JLabel("Match requests by")); fields.add(matchBy);
+        fields.add(scopeLabel); fields.add(scope);
+        fields.add(new JLabel("Required marker header")); fields.add(marker);
         fields.add(new JLabel("Renew every (seconds)")); fields.add(interval);
         fields.add(new JLabel("HTTP protocol")); fields.add(protocol);
-        fields.add(enabled); fields.add(auto); content.add(fields, BorderLayout.NORTH);
+        content.add(fields, BorderLayout.NORTH);
         IMessageEditor requestEditor = extension.getCallbacks().createMessageEditor(null, true);
         String raw = existing == null ? "GET /refresh HTTP/1.1\r\nHost: example.test\r\n\r\n" : existing.request;
         requestEditor.setMessage(imported == null ? extension.getCallbacks().getHelpers().stringToBytes(raw) : imported.getRequest(), true);
@@ -165,7 +194,7 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
         extraction.add(ruleButtons, BorderLayout.SOUTH);
         JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, requestEditor.getComponent(), extraction); split.setResizeWeight(.55); content.add(split, BorderLayout.CENTER);
         JPanel bottom = new JPanel(new BorderLayout());
-        bottom.add(new JLabel("Initial values bootstrap renewal. Values are inserted literally. Use Save profiles to persist settings and values. Current tokens and renewal details are visible in the Debugging tab."), BorderLayout.NORTH);
+        bottom.add(new JLabel("Initial values bootstrap renewal. Values are inserted literally. Use Save profiles to persist settings and values. See Tokens for current values and Debugging for renewal exchanges."), BorderLayout.NORTH);
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT));
         JButton cancel = new JButton("Cancel"); cancel.addActionListener(e -> dialog.dispose()); buttons.add(cancel);
         for (String action : new String[]{"Save", "Save and test"}) {
@@ -177,7 +206,7 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
                             cell(rules, row, 0), SessionProfile.Source.valueOf(cell(rules, row, 1)), cell(rules, row, 2), cell(rules, row, 3),
                             SessionProfile.Destination.valueOf(cell(rules, row, 4)), cell(rules, row, 5), cell(rules, row, 6)));
                     SessionProfile profile = new SessionProfile(name.getText().trim(), new URL(endpoint.getText().trim()), new URL(scope.getText().trim()),
-                            extension.getCallbacks().getHelpers().bytesToString(requestEditor.getMessage()), ((Number) interval.getValue()).intValue(), definitions, enabled.isSelected(), auto.isSelected(), (ReauthHttpClient.Protocol) protocol.getSelectedItem());
+                            extension.getCallbacks().getHelpers().bytesToString(requestEditor.getMessage()), ((Number) interval.getValue()).intValue(), definitions, existing != null && existing.enabled, "Scope".equals(matchBy.getSelectedItem()), (ReauthHttpClient.Protocol) protocol.getSelectedItem());
                     profiles.save(profile, existing == null ? null : existing.name);
                     if (action.equals("Save and test") && !profile.enabled) profiles.test(profile.name);
                     refresh(); dialog.dispose();

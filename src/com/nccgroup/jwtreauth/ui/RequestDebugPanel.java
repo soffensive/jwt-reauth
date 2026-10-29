@@ -26,7 +26,6 @@ import javax.swing.table.*;
 import java.awt.*;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.regex.Pattern;
 
 public final class RequestDebugPanel extends JPanel implements IExtensionStateListener {
@@ -39,7 +38,9 @@ public final class RequestDebugPanel extends JPanel implements IExtensionStateLi
     private final IMessageEditor before, after;
     private final ViewerContext beforeContext = new ViewerContext(), afterContext = new ViewerContext();
     private final IExtensionHelpers helpers;
-    private final JTextArea details = textArea(), tokens = textArea();
+    private final JTextArea details = textArea();
+    private final JTabbedPane inspection = new JTabbedPane();
+    private final JLabel leftLabel = new JLabel("Before extension changes"), rightLabel = new JLabel("After extension changes");
     private final JCheckBox follow = new JCheckBox("Follow latest", true);
     private final Timer timer;
     private List<RequestDebugLog.Event> rows = new ArrayList<>();
@@ -65,12 +66,10 @@ public final class RequestDebugPanel extends JPanel implements IExtensionStateLi
         });
         table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         table.getSelectionModel().addListSelectionListener(e -> { if (!e.getValueIsAdjusting()) showSelected(); });
-        JTabbedPane inspection = new JTabbedPane();
-        JSplitPane comparison = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, labeled("Before extension changes", before.getComponent()), labeled("After extension changes", after.getComponent()));
+        JSplitPane comparison = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, labeled(leftLabel, before.getComponent()), labeled(rightLabel, after.getComponent()));
         comparison.setResizeWeight(.5);
         inspection.addTab("Request before / after", comparison);
-        inspection.addTab("Decision / renewal response", new JScrollPane(details));
-        inspection.addTab("Current tokens and variables", new JScrollPane(tokens));
+        inspection.addTab("Details", new JScrollPane(details));
         JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, new JScrollPane(table), inspection);
         split.setResizeWeight(.4); add(split, BorderLayout.CENTER);
         add(new JLabel("Latest 200 events. Request/response views show up to 64 KiB. Tokens and credentials are visible."), BorderLayout.SOUTH);
@@ -80,26 +79,27 @@ public final class RequestDebugPanel extends JPanel implements IExtensionStateLi
     private static JTextArea textArea() {
         JTextArea area = new JTextArea(); area.setEditable(false); area.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12)); return area;
     }
-    private static JPanel labeled(String label, Component viewer) {
-        JPanel panel = new JPanel(new BorderLayout()); panel.add(new JLabel(label), BorderLayout.NORTH); panel.add(viewer, BorderLayout.CENTER); return panel;
+    private static JPanel labeled(JLabel label, Component viewer) {
+        JPanel panel = new JPanel(new BorderLayout()); panel.add(label, BorderLayout.NORTH); panel.add(viewer, BorderLayout.CENTER); return panel;
     }
     private static final class ViewerContext implements IMessageEditorController {
         private volatile IHttpService service;
-        private volatile byte[] request;
+        private volatile byte[] request, response;
         @Override public IHttpService getHttpService() { return service; }
         @Override public byte[] getRequest() { return request; }
-        @Override public byte[] getResponse() { return null; }
+        @Override public byte[] getResponse() { return response; }
     }
-    private void display(IMessageEditor viewer, ViewerContext context, String request, IHttpService service) {
+    private void display(IMessageEditor viewer, ViewerContext context, String request, String response, IHttpService service, boolean isRequest) {
         context.service = service;
         context.request = request == null || request.isEmpty() ? null : helpers.stringToBytes(request);
-        // Some Burp versions reject null when clearing a native message viewer.
-        viewer.setMessage(context.request == null ? new byte[0] : context.request, true);
+        context.response = response == null || response.isEmpty() ? null : helpers.stringToBytes(response);
+        byte[] message = isRequest ? context.request : context.response;
+        viewer.setMessage(message == null ? new byte[0] : message, isRequest);
     }
     private void showSelected() {
         int selected = table.getSelectedRow();
         if (selected < 0) {
-            display(before, beforeContext, null, null); display(after, afterContext, null, null);
+            display(before, beforeContext, null, null, null, true); display(after, afterContext, null, null, null, true);
             details.setText(""); return;
         }
         RequestDebugLog.Event event = rows.get(table.convertRowIndexToModel(selected));
@@ -108,30 +108,21 @@ public final class RequestDebugPanel extends JPanel implements IExtensionStateLi
             URL url = new URL(event.url);
             service = helpers.buildHttpService(url.getHost(), SessionProfile.port(url), url.getProtocol());
         } catch (java.net.MalformedURLException ignored) { }
-        display(before, beforeContext, event.before, service);
-        display(after, afterContext, event.after, service);
+        boolean renewal = event.kind.equals("Renewal");
+        inspection.setTitleAt(0, renewal ? "Renewal request / response" : "Request before / after");
+        leftLabel.setText(renewal ? "Renewal request" : "Before extension changes");
+        rightLabel.setText(renewal ? "Renewal response" : "After extension changes");
+        display(before, beforeContext, event.before, renewal ? event.response : null, service, true);
+        display(after, afterContext, renewal ? event.before : event.after, renewal ? event.response : null, service, !renewal);
         details.setText(event.reason + "\n\n" + event.details);
         details.setCaretPosition(0);
     }
     private void refresh() {
-        StringBuilder state = new StringBuilder();
-        for (SessionProfile p : profiles.list()) {
-            state.append(p.name).append(" — ").append(p.status).append(p.lastSuccess == null ? " (awaiting renewal)" : "").append("\n");
-            Map<String, String> values = p.snapshot();
-            for (SessionProfile.Rule rule : p.rules) {
-                state.append("  ").append(rule.variable).append(" = ").append(values.get(rule.variable)).append("\n");
-                if (rule.destination != SessionProfile.Destination.VARIABLE)
-                    state.append("    ").append(rule.destination).append(" ").append(rule.target).append(": ").append(rule.prefix).append(values.get(rule.variable)).append("\n");
-            }
-            state.append("\n");
-        }
-        String rendered = state.length() == 0 ? "No session profiles configured." : state.toString();
-        if (!tokens.getText().equals(rendered)) { int caret = tokens.getCaretPosition(); tokens.setText(rendered); tokens.setCaretPosition(Math.min(caret, rendered.length())); }
         long latest = log.revision(); if (latest == revision) return;
         long selectedId = -1;
         if (table.getSelectedRow() >= 0) selectedId = rows.get(table.convertRowIndexToModel(table.getSelectedRow())).id;
         rows = log.snapshot(); revision = latest; model.setRowCount(0);
-        for (RequestDebugLog.Event event : rows) model.addRow(new Object[]{event.time, event.kind, event.profile, event.url, event.changed ? "Yes" : "No", event.reason});
+        for (RequestDebugLog.Event event : rows) model.addRow(new Object[]{event.time, event.kind, event.profile, event.url, event.kind.equals("Renewal") ? "—" : event.changed ? "Yes" : "No", event.reason});
         int target = -1;
         for (int i = 0; i < rows.size(); i++) if (follow.isSelected() || rows.get(i).id == selectedId) {
             int view = table.convertRowIndexToView(i); if (view >= 0) target = view;

@@ -19,7 +19,7 @@ import java.util.*;
 import java.util.regex.*;
 import java.time.Instant;
 
-/** Configuration is immutable; a renewal publishes a complete value snapshot. */
+/** Configuration is immutable except activation; renewals publish complete value snapshots. */
 public final class SessionProfile {
     public enum Source { COOKIE, HEADER, JSON, REGEX }
     public enum Destination { VARIABLE, COOKIE, HEADER }
@@ -80,7 +80,8 @@ public final class SessionProfile {
     public final int interval;
     public final ReauthHttpClient.Protocol protocol;
     public final List<Rule> rules;
-    public final boolean enabled, autoMatch;
+    public volatile boolean enabled;
+    public final boolean autoMatch;
     private volatile Map<String, String> values;
     public volatile String status = "Ready — not renewed yet";
     public volatile Instant lastSuccess, nextRenewal;

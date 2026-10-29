@@ -60,6 +60,16 @@ public final class SessionProfiles implements IExtensionStateListener {
             entry.schedule = workers.scheduleWithFixedDelay(() -> renew(entry), 0, profile.interval, TimeUnit.SECONDS);
         }
     }
+    /** Toggle scheduling and injection without replacing tokens or an in-flight renewal. */
+    public synchronized void setEnabled(String name, boolean enabled) {
+        if (closed) throw new IllegalStateException("Extension unloaded");
+        Entry entry = entries.get(name);
+        if (entry == null || entry.profile.enabled == enabled) return;
+        entry.profile.enabled = enabled;
+        if (entry.schedule != null) { entry.schedule.cancel(false); entry.schedule = null; }
+        entry.profile.nextRenewal = enabled ? Instant.now() : null;
+        if (enabled) entry.schedule = workers.scheduleWithFixedDelay(() -> renew(entry), 0, entry.profile.interval, TimeUnit.SECONDS);
+    }
     /** Merge a fully validated file; imported values replace same-name profile state. */
     public synchronized void loadProfiles(List<SessionProfile> profiles) {
         if (closed) throw new IllegalStateException("Extension unloaded");
@@ -84,7 +94,7 @@ public final class SessionProfiles implements IExtensionStateListener {
     }
     private synchronized boolean active(Entry entry) { return !closed && entries.get(entry.profile.name) == entry; }
     private void renew(Entry entry) {
-        if (!active(entry) || !entry.busy.compareAndSet(false, true)) return;
+        if (!active(entry) || !entry.profile.enabled || !entry.busy.compareAndSet(false, true)) return;
         runRenewal(entry);
     }
     private void runRenewal(Entry entry) {
@@ -111,7 +121,7 @@ public final class SessionProfiles implements IExtensionStateListener {
             int status = helpers.analyzeResponse(response).getStatusCode();
             if (status < 200 || status >= 300) throw new IllegalArgumentException("HTTP " + status);
             if (!active(entry)) {
-                debugLog.add("Renewal", profile.name, profile.endpoint.toString(), "Discarded result: profile deleted or replaced", requestText, requestText, responseText);
+                debugLog.addRenewal(profile.name, profile.endpoint.toString(), "Discarded result: profile deleted or replaced", requestText, responseText, "Profile no longer active.");
                 return;
             }
             Map<String, String> before = profile.snapshot();
@@ -120,15 +130,15 @@ public final class SessionProfiles implements IExtensionStateListener {
             profile.snapshot().forEach((name, value) -> results.add(name + (Objects.equals(before.get(name), value) ? " unchanged" : " updated")));
             profile.lastSuccess = Instant.now();
             profile.status = "Ready — " + String.join(", ", results);
-            debugLog.add("Renewal", profile.name, profile.endpoint.toString(), profile.status, requestText, requestText,
-                    "Protocol: " + prepared.description() + "\nPrevious variables: " + previousValues + "\nCurrent variables: " + profile.snapshot() + "\n\nResponse:\n" + responseText);
+            debugLog.addRenewal(profile.name, profile.endpoint.toString(), profile.status, requestText, responseText,
+                    "Protocol: " + prepared.description() + "\nPrevious variables: " + previousValues + "\nCurrent variables: " + profile.snapshot());
         } catch (RuntimeException ex) {
             // Do not include exception messages from parsers or HTTP helpers: they may contain secrets.
             profile.status = "Failed — " + (ex instanceof com.google.gson.JsonParseException ? "malformed JSON; previous values retained" : ex instanceof IllegalArgumentException && ex.getMessage() != null &&
                     (ex.getMessage().startsWith("Missing response value:") || ex.getMessage().startsWith("Invalid value for destination:") || ex.getMessage().startsWith("HTTP ") || ex.getMessage().equals("No HTTP response"))
                     ? ex.getMessage() : "invalid response or request; previous values retained");
-            debugLog.add("Renewal", profile.name, profile.endpoint.toString(), profile.status, requestText, requestText,
-                    "Retained variables: " + profile.snapshot() + "\n" + ex.toString() + "\nProtocol: " + profile.protocol + "\n\nResponse:\n" + responseText);
+            debugLog.addRenewal(profile.name, profile.endpoint.toString(), profile.status, requestText, responseText,
+                    "Retained variables: " + profile.snapshot() + "\n" + ex.toString() + "\nProtocol: " + profile.protocol);
         } finally {
             if (flightKey != null) inFlight.computeIfPresent(flightKey, (key, count) -> count == 1 ? null : count - 1);
             if (targetKey != null) inFlight.computeIfPresent(targetKey, (key, count) -> count == 1 ? null : count - 1);
@@ -168,7 +178,8 @@ public final class SessionProfiles implements IExtensionStateListener {
         }
         List<SessionProfile> matches = new ArrayList<>();
         for (SessionProfile p : profiles) {
-            if (p.enabled && p.matches(url) && (markers.isEmpty() ? p.autoMatch : markers.size() == 1 && p.name.equals(markers.get(0)))) matches.add(p);
+            boolean selected = p.autoMatch ? markers.isEmpty() : markers.size() == 1 && p.name.equals(markers.get(0));
+            if (p.enabled && p.matches(url) && selected) matches.add(p);
         }
         if (matches.size() != 1) {
             if (!markers.isEmpty() || matches.size() > 1) {
@@ -176,7 +187,10 @@ public final class SessionProfiles implements IExtensionStateListener {
                 if (markers.size() > 1) reason = "Multiple profile markers; credentials not injected";
                 else if (!markers.isEmpty()) {
                     SessionProfile named = profiles.stream().filter(p -> p.name.equals(markers.get(0))).findFirst().orElse(null);
-                    reason = named == null ? "Unknown profile; credentials not injected" : !named.enabled ? "Profile disabled; credentials not injected" : "Outside profile scope; credentials not injected";
+                    reason = named == null ? "Unknown profile; credentials not injected"
+                            : !named.enabled ? "Profile disabled; credentials not injected"
+                            : named.autoMatch ? "Profile uses Scope mode, not Marker mode; credentials not injected"
+                            : "Outside allowed URLs for marker; credentials not injected";
                 } else reason = "Ambiguous profiles: " + matches.stream().map(p -> p.name).collect(java.util.stream.Collectors.joining(", ")) + "; credentials not injected";
                 extension.getLogController().info("%s", reason);
                 recordRequest(String.join(", ", markers), url, reason, original, message);

@@ -48,14 +48,72 @@ public final class SessionProfilesTest {
             assert Arrays.equals(fixture.editors.get(0).controller.getRequest(), bytes(original));
             assert Arrays.equals(fixture.editors.get(1).controller.getRequest(), bytes(modified));
             assert fixture.editors.get(1).controller.getHttpService().getHost().equals("example.test");
+            extension.getSessionProfiles().getDebugLog().addRenewal("alice", "https://example.test/refresh", "Renewed", original, RESPONSE, "Extracted tokens");
+            await(() -> Arrays.equals(fixture.editors.get(1).message, bytes(RESPONSE)));
+            assert fixture.editors.get(0).isRequest && !fixture.editors.get(1).isRequest;
+            assert Arrays.equals(fixture.editors.get(1).controller.getRequest(), bytes(original));
+            assert Arrays.equals(fixture.editors.get(1).controller.getResponse(), bytes(RESPONSE));
+            assert Arrays.equals(fixture.editors.get(0).controller.getResponse(), bytes(RESPONSE));
+            String errorResponse = "HTTP/2 401 Unauthorized\r\nContent-Type: application/json\r\n\r\n{\"error\":\"expired\"}";
+            extension.getSessionProfiles().getDebugLog().addRenewal("alice", "https://example.test/refresh", "Failed", original, errorResponse, "HTTP 401");
+            await(() -> Arrays.equals(fixture.editors.get(1).message, bytes(errorResponse)));
+            assert !fixture.editors.get(1).isRequest;
+            extension.getSessionProfiles().getDebugLog().addRenewal("alice", "https://example.test/refresh", "No response", original, "", "Connection failed");
+            await(() -> fixture.editors.get(1).message.length == 0);
+            assert Arrays.equals(fixture.editors.get(0).message, bytes(original));
+            assert fixture.editors.get(1).controller.getResponse() == null;
+            extension.getSessionProfiles().getDebugLog().add("Request", "alice", "https://example.test/api", "Applied profile", original, modified, "");
+            await(() -> Arrays.equals(fixture.editors.get(1).message, bytes(modified)));
+            assert fixture.editors.get(1).isRequest && fixture.editors.get(1).controller.getResponse() == null;
             extension.getSessionProfiles().getDebugLog().clear();
             await(() -> fixture.editors.get(0).message != null && fixture.editors.get(0).message.length == 0
                     && fixture.editors.get(1).message != null && fixture.editors.get(1).message.length == 0);
             assert fixture.editors.get(0).controller.getHttpService() == null;
             javax.swing.SwingUtilities.invokeAndWait(() -> {
                 javax.swing.JTabbedPane tabs = (javax.swing.JTabbedPane)new MainViewController(extension).getUiComponent();
-                assert tabs.getTabCount() == 2 && tabs.getTitleAt(0).equals("Sessions") && tabs.getTitleAt(1).equals("Debugging");
+                assert tabs.getTabCount() == 3 && tabs.getTitleAt(0).equals("Sessions")
+                        && tabs.getTitleAt(1).equals("Tokens") && tabs.getTitleAt(2).equals("Debugging");
+                assert tabs.getComponentAt(1) instanceof com.nccgroup.jwtreauth.ui.TokenValuesPanel;
             });
+            SessionProfile tokenProfile = profile("visible", false, false);
+            extension.getSessionProfiles().save(tokenProfile, null);
+            await(() -> {
+                java.util.concurrent.atomic.AtomicBoolean visible = new java.util.concurrent.atomic.AtomicBoolean();
+                try {
+                    javax.swing.SwingUtilities.invokeAndWait(() -> fixture.listeners.stream()
+                            .filter(listener -> listener instanceof com.nccgroup.jwtreauth.ui.TokenValuesPanel)
+                            .forEach(listener -> visible.set(visible.get() || hasText((java.awt.Component)listener, "seed-visible"))));
+                } catch (Exception ex) { throw new AssertionError(ex); }
+                return visible.get();
+            });
+            javax.swing.JTable overview = findTable(extension.getSessionProfilesPanel());
+            await(() -> {
+                java.util.concurrent.atomic.AtomicBoolean ready = new java.util.concurrent.atomic.AtomicBoolean();
+                try { javax.swing.SwingUtilities.invokeAndWait(() -> ready.set(overview.getRowCount() == 1)); }
+                catch (Exception ex) { throw new AssertionError(ex); }
+                return ready.get();
+            });
+            javax.swing.SwingUtilities.invokeAndWait(() -> {
+                assert overview.getColumnName(1).equals("Active");
+                assert overview.getValueAt(0, 2).equals("Marker");
+                assert overview.getValueAt(0, 3).toString().contains("X-Reauth-Profile: visible");
+                assert overview.getValueAt(0, 3).toString().contains("https://example.test/api");
+                assert overview.getColumnClass(1) == Boolean.class;
+                assert overview.isCellEditable(0, 1) && !overview.isCellEditable(0, 0);
+                overview.setValueAt(Boolean.TRUE, 0, 1);
+            });
+            assert tokenProfile.enabled;
+            await(() -> tokenProfile.lastSuccess != null);
+            Map<String, String> renewedValues = tokenProfile.snapshot();
+            IHttpRequestResponse activeRequest = fixture.message("GET /api HTTP/1.1\r\nHost: example.test\r\nX-Reauth-Profile: visible\r\n\r\n");
+            extension.getSessionProfiles().process(true, activeRequest);
+            assert string(activeRequest.getRequest()).contains("Authorization: Bearer new-token");
+            javax.swing.SwingUtilities.invokeAndWait(() -> overview.setValueAt(Boolean.FALSE, 0, 1));
+            assert !tokenProfile.enabled && tokenProfile.nextRenewal == null;
+            assert tokenProfile.snapshot() == renewedValues : "Activation must retain rotated credentials";
+            IHttpRequestResponse inactiveRequest = fixture.message("GET /api HTTP/1.1\r\nHost: example.test\r\nX-Reauth-Profile: visible\r\n\r\n");
+            extension.getSessionProfiles().process(true, inactiveRequest);
+            assert !string(inactiveRequest.getRequest()).contains("Authorization:");
             IContextMenuInvocation invocation = proxy(IContextMenuInvocation.class, (p, m, a) ->
                     m.getName().equals("getInvocationContext") ? IContextMenuInvocation.CONTEXT_PROXY_HISTORY : null);
             assert new JWTReauthContextMenuFactory(extension).createMenuItems(invocation).size() == 1;
@@ -64,6 +122,19 @@ public final class SessionProfilesTest {
             if (extension.getSessionProfiles() != null) extension.getSessionProfiles().extensionUnloaded();
             if (extension.getSessionProfilesPanel() != null) extension.getSessionProfilesPanel().extensionUnloaded();
         }
+    }
+    private static javax.swing.JTable findTable(java.awt.Component component) {
+        if (component instanceof javax.swing.JTable) return (javax.swing.JTable)component;
+        if (component instanceof java.awt.Container) for (java.awt.Component child : ((java.awt.Container)component).getComponents()) {
+            javax.swing.JTable found = findTable(child); if (found != null) return found;
+        }
+        return null;
+    }
+    private static boolean hasText(java.awt.Component component, String expected) {
+        if (component instanceof javax.swing.JTextArea && ((javax.swing.JTextArea)component).getText().contains(expected)) return true;
+        if (component instanceof java.awt.Container) for (java.awt.Component child : ((java.awt.Container)component).getComponents())
+            if (hasText(child, expected)) return true;
+        return false;
     }
     private static SessionProfile profile(String name, boolean enabled, boolean automatic) throws Exception {
         return new SessionProfile(name, new URL("https://example.test/refresh"), new URL("https://example.test/api"),
@@ -90,7 +161,7 @@ public final class SessionProfilesTest {
     private static void routing() throws Exception {
         Fixture f = new Fixture(); SessionProfiles profiles = new SessionProfiles(f.extension);
         try {
-            SessionProfile alice = profile("alice", true, true), bob = profile("bob", true, true);
+            SessionProfile alice = profile("alice", true, false), bob = profile("bob", true, false);
             profiles.save(alice, null); profiles.save(bob, null);
             await(() -> alice.lastSuccess != null && bob.lastSuccess != null);
             Map<String, String> successful = alice.snapshot();
@@ -117,6 +188,16 @@ public final class SessionProfilesTest {
             assert changed.details.contains("Removed: X-Reauth-Profile: alice");
             assert changed.details.contains("Added: Authorization: Bearer new-token");
             assert changed.reason.contains("marker");
+            IHttpRequestResponse unmarked = f.message("GET /api/users HTTP/1.1\r\nHost: example.test\r\n\r\n");
+            assert !profiles.process(true, unmarked) : "Marker profiles must not modify unmarked traffic";
+            assert !string(unmarked.getRequest()).contains("Authorization:");
+            SessionProfile scopeAlice = profile("scope-alice", true, true), scopeBob = profile("scope-bob", true, true);
+            profiles.save(scopeAlice, null); profiles.save(scopeBob, null);
+            await(() -> scopeAlice.lastSuccess != null && scopeBob.lastSuccess != null);
+            IHttpRequestResponse markedScope = f.message("GET /api/users HTTP/1.1\r\nHost: example.test\r\nX-Reauth-Profile: scope-alice\r\n\r\n");
+            assert profiles.process(true, markedScope);
+            assert !string(markedScope.getRequest()).contains("Authorization:") : "Scope profiles must not be selected by marker";
+            assert latest(profiles).reason.contains("Scope mode");
             IHttpRequestResponse conflict = f.message("GET /api/users HTTP/1.1\r\nHost: example.test\r\n\r\n");
             assert profiles.process(true, conflict);
             assert !string(conflict.getRequest()).contains("Authorization:");
@@ -129,15 +210,15 @@ public final class SessionProfilesTest {
             IHttpRequestResponse outside = f.message("GET /outside HTTP/1.1\r\nHost: example.test\r\nX-Reauth-Profile: alice\r\n\r\n");
             assert profiles.process(true, outside);
             assert !string(outside.getRequest()).contains("Authorization:");
-            profiles.remove("bob");
+            profiles.remove("scope-bob");
             assert profiles.process(true, conflict);
             assert string(conflict.getRequest()).contains("Authorization: Bearer new-token");
             assert latest(profiles).reason.contains("scope");
             assert profiles.process(true, conflict);
             assert !latest(profiles).changed : "Already-correct credentials should report no change";
             assert profiles.getDebugLog().snapshot().stream().anyMatch(event -> event.kind.equals("Renewal")
-                    && event.details.contains("new-token") && event.details.contains("Response:"));
-            profiles.remove("alice");
+                    && event.details.contains("new-token") && event.response.equals(RESPONSE) && !event.changed);
+            profiles.remove("alice"); profiles.remove("bob"); profiles.remove("scope-alice");
             assert !profiles.process(true, f.message("GET /api HTTP/1.1\r\nHost: example.test\r\n\r\n"));
         } finally { profiles.extensionUnloaded(); }
     }

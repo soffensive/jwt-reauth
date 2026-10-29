@@ -23,20 +23,26 @@ public final class RequestDebugLog {
     public static final class Event {
         public final long id;
         public final Instant time = Instant.now();
-        public final String kind, profile, url, reason, before, after, details;
+        public final String kind, profile, url, reason, before, after, response, details;
         public final boolean changed;
         private Event(long id, String kind, String profile, String url, String reason,
-                      String before, String after, String details) {
+                      String before, String after, String response, String details) {
             this.id = id; this.kind = kind; this.profile = profile; this.url = url;
-            this.reason = reason; this.changed = !Objects.equals(before, after);
-            this.before = limit(before); this.after = limit(after); this.details = limit(details);
+            this.reason = reason; this.changed = !kind.equals("Renewal") && !Objects.equals(before, after);
+            this.before = limit(before); this.after = limit(after); this.response = limit(response); this.details = limit(details);
         }
     }
     private final Deque<Event> events = new ArrayDeque<>();
     private long sequence, revision;
     public synchronized void add(String kind, String profile, String url, String reason,
                                  String before, String after, String details) {
-        events.addLast(new Event(++sequence, kind, profile, url, reason, before, after, details));
+        append(new Event(++sequence, kind, profile, url, reason, before, after, "", details));
+    }
+    public synchronized void addRenewal(String profile, String url, String reason, String request, String response, String details) {
+        append(new Event(++sequence, "Renewal", profile, url, reason, request, "", response, details));
+    }
+    private void append(Event event) {
+        events.addLast(event);
         while (events.size() > MAX_EVENTS) events.removeFirst();
         revision++;
     }
