@@ -36,6 +36,22 @@ public final class SessionProfilesTest {
             javax.swing.SwingUtilities.invokeAndWait(() -> extension.registerExtenderCallbacks(fixture.callbacks));
             assert extension.getSessionProfiles() != null;
             assert extension.getSessionProfilesPanel() != null;
+            assert fixture.editors.size() == 2;
+            assert fixture.editors.stream().allMatch(editor -> editor.message != null && editor.message.length == 0)
+                    : "Empty history must initialize viewers with an empty, non-null message";
+            assert fixture.editors.stream().noneMatch(editor -> editor.editable);
+            String original = "GET /api HTTP/2\r\nHost: example.test\r\n\r\n";
+            String modified = "GET /api HTTP/2\r\nHost: example.test\r\nAuthorization: Bearer visible-token\r\n\r\n";
+            extension.getSessionProfiles().getDebugLog().add("Request", "alice", "https://example.test/api", "Applied profile", original, modified, "");
+            await(() -> Arrays.equals(fixture.editors.get(0).message, bytes(original)) && Arrays.equals(fixture.editors.get(1).message, bytes(modified)));
+            assert fixture.editors.get(0).isRequest && fixture.editors.get(1).isRequest;
+            assert Arrays.equals(fixture.editors.get(0).controller.getRequest(), bytes(original));
+            assert Arrays.equals(fixture.editors.get(1).controller.getRequest(), bytes(modified));
+            assert fixture.editors.get(1).controller.getHttpService().getHost().equals("example.test");
+            extension.getSessionProfiles().getDebugLog().clear();
+            await(() -> fixture.editors.get(0).message != null && fixture.editors.get(0).message.length == 0
+                    && fixture.editors.get(1).message != null && fixture.editors.get(1).message.length == 0);
+            assert fixture.editors.get(0).controller.getHttpService() == null;
             javax.swing.SwingUtilities.invokeAndWait(() -> {
                 javax.swing.JTabbedPane tabs = (javax.swing.JTabbedPane)new MainViewController(extension).getUiComponent();
                 assert tabs.getTabCount() == 2 && tabs.getTitleAt(0).equals("Sessions") && tabs.getTitleAt(1).equals("Debugging");
@@ -281,7 +297,29 @@ public final class SessionProfilesTest {
     private static <T> T proxy(Class<T> type, InvocationHandler handler) { return (T) Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[]{type}, handler); }
     private static byte[] bytes(String s) { return s.getBytes(StandardCharsets.ISO_8859_1); }
     private static String string(byte[] bytes) { return new String(bytes, StandardCharsets.ISO_8859_1); }
+    private static final class EditorDouble {
+        final IMessageEditorController controller;
+        final boolean editable;
+        volatile byte[] message;
+        volatile boolean isRequest;
+        final javax.swing.JPanel component = new javax.swing.JPanel();
+        EditorDouble(IMessageEditorController controller, boolean editable) { this.controller = controller; this.editable = editable; }
+        IMessageEditor editor() {
+            return proxy(IMessageEditor.class, (p, method, args) -> {
+                switch (method.getName()) {
+                    case "getComponent": return component;
+                    case "setMessage":
+                        if (args[0] == null) throw new NullPointerException("Message cannot be null");
+                        isRequest = (Boolean)args[1]; message = ((byte[])args[0]).clone(); return null;
+                    case "getMessage": return message;
+                    case "isMessageModified": return false;
+                    default: return null;
+                }
+            });
+        }
+    }
     private static final class Fixture {
+        final List<EditorDouble> editors = new CopyOnWriteArrayList<>();
         final List<IExtensionStateListener> listeners = new CopyOnWriteArrayList<>();
         final ConcurrentLinkedQueue<String> sentRequests = new ConcurrentLinkedQueue<>();
         final AtomicInteger calls = new AtomicInteger(), concurrent = new AtomicInteger(), maxConcurrent = new AtomicInteger();
@@ -321,6 +359,10 @@ public final class SessionProfilesTest {
         });
         final IBurpExtenderCallbacks callbacks = proxy(IBurpExtenderCallbacks.class, (p, m, a) -> {
             if (m.getName().equals("getHelpers")) return helpers;
+            if (m.getName().equals("createMessageEditor")) {
+                EditorDouble editor = new EditorDouble((IMessageEditorController)a[0], (Boolean)a[1]);
+                editors.add(editor); return editor.editor();
+            }
             if (m.getName().equals("registerExtensionStateListener")) { listeners.add((IExtensionStateListener)a[0]); return null; }
             if (m.getName().equals("makeHttp2Request")) {
                 assert a.length == 4 && Boolean.TRUE.equals(a[3]);

@@ -115,7 +115,9 @@ and [extension HTTP APIs](https://portswigger.net/burp/extender/api/burp/iburpex
 
 Open **Debugging** to inspect profile routing, injected headers and cookies,
 removed profile markers, and reasons why credentials were not applied. Select an
-event to compare the request before and after extension changes. The decision
+event to compare the request before and after extension changes in Burp's
+standard read-only message viewers, including its Raw/Hex views and request
+context-menu actions. The decision
 view lists added/removed headers; renewal events include the HTTP response and
 previous/current extracted values.
 

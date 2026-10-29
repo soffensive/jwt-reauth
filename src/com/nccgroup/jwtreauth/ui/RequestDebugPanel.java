@@ -14,6 +14,11 @@ limitations under the License.
 package com.nccgroup.jwtreauth.ui;
 
 import burp.IExtensionStateListener;
+import burp.IExtensionHelpers;
+import burp.IMessageEditor;
+import burp.IMessageEditorController;
+import burp.IHttpService;
+import java.net.URL;
 import com.nccgroup.jwtreauth.*;
 import javax.swing.*;
 import javax.swing.event.*;
@@ -31,7 +36,10 @@ public final class RequestDebugPanel extends JPanel implements IExtensionStateLi
         @Override public boolean isCellEditable(int row, int column) { return false; }
     };
     private final JTable table = new JTable(model);
-    private final JTextArea before = textArea(), after = textArea(), details = textArea(), tokens = textArea();
+    private final IMessageEditor before, after;
+    private final ViewerContext beforeContext = new ViewerContext(), afterContext = new ViewerContext();
+    private final IExtensionHelpers helpers;
+    private final JTextArea details = textArea(), tokens = textArea();
     private final JCheckBox follow = new JCheckBox("Follow latest", true);
     private final Timer timer;
     private List<RequestDebugLog.Event> rows = new ArrayList<>();
@@ -40,6 +48,9 @@ public final class RequestDebugPanel extends JPanel implements IExtensionStateLi
     public RequestDebugPanel(JWTReauth extension) {
         super(new BorderLayout(5, 5));
         profiles = extension.getSessionProfiles(); log = profiles.getDebugLog();
+        helpers = extension.getCallbacks().getHelpers();
+        before = extension.getCallbacks().createMessageEditor(beforeContext, false);
+        after = extension.getCallbacks().createMessageEditor(afterContext, false);
         JPanel controls = new JPanel(new FlowLayout(FlowLayout.LEFT));
         JTextField search = new JTextField(25);
         controls.add(new JLabel("Filter:")); controls.add(search); controls.add(follow);
@@ -55,7 +66,7 @@ public final class RequestDebugPanel extends JPanel implements IExtensionStateLi
         table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         table.getSelectionModel().addListSelectionListener(e -> { if (!e.getValueIsAdjusting()) showSelected(); });
         JTabbedPane inspection = new JTabbedPane();
-        JSplitPane comparison = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, labeled("Before extension changes", before), labeled("After extension changes", after));
+        JSplitPane comparison = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, labeled("Before extension changes", before.getComponent()), labeled("After extension changes", after.getComponent()));
         comparison.setResizeWeight(.5);
         inspection.addTab("Request before / after", comparison);
         inspection.addTab("Decision / renewal response", new JScrollPane(details));
@@ -69,16 +80,38 @@ public final class RequestDebugPanel extends JPanel implements IExtensionStateLi
     private static JTextArea textArea() {
         JTextArea area = new JTextArea(); area.setEditable(false); area.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12)); return area;
     }
-    private static JPanel labeled(String label, JTextArea area) {
-        JPanel panel = new JPanel(new BorderLayout()); panel.add(new JLabel(label), BorderLayout.NORTH); panel.add(new JScrollPane(area), BorderLayout.CENTER); return panel;
+    private static JPanel labeled(String label, Component viewer) {
+        JPanel panel = new JPanel(new BorderLayout()); panel.add(new JLabel(label), BorderLayout.NORTH); panel.add(viewer, BorderLayout.CENTER); return panel;
+    }
+    private static final class ViewerContext implements IMessageEditorController {
+        private volatile IHttpService service;
+        private volatile byte[] request;
+        @Override public IHttpService getHttpService() { return service; }
+        @Override public byte[] getRequest() { return request; }
+        @Override public byte[] getResponse() { return null; }
+    }
+    private void display(IMessageEditor viewer, ViewerContext context, String request, IHttpService service) {
+        context.service = service;
+        context.request = request == null || request.isEmpty() ? null : helpers.stringToBytes(request);
+        // Some Burp versions reject null when clearing a native message viewer.
+        viewer.setMessage(context.request == null ? new byte[0] : context.request, true);
     }
     private void showSelected() {
         int selected = table.getSelectedRow();
-        if (selected < 0) { before.setText(""); after.setText(""); details.setText(""); return; }
+        if (selected < 0) {
+            display(before, beforeContext, null, null); display(after, afterContext, null, null);
+            details.setText(""); return;
+        }
         RequestDebugLog.Event event = rows.get(table.convertRowIndexToModel(selected));
-        before.setText(event.before); after.setText(event.after);
+        IHttpService service = null;
+        try {
+            URL url = new URL(event.url);
+            service = helpers.buildHttpService(url.getHost(), SessionProfile.port(url), url.getProtocol());
+        } catch (java.net.MalformedURLException ignored) { }
+        display(before, beforeContext, event.before, service);
+        display(after, afterContext, event.after, service);
         details.setText(event.reason + "\n\n" + event.details);
-        before.setCaretPosition(0); after.setCaretPosition(0); details.setCaretPosition(0);
+        details.setCaretPosition(0);
     }
     private void refresh() {
         StringBuilder state = new StringBuilder();
