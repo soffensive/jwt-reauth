@@ -1,6 +1,6 @@
 /*
 Copyright 2022 NCC Group
-Modified in the soffensive/jwt-reauth fork (2026): add the Sessions tab and retain legacy settings.
+Modified in the soffensive/jwt-reauth fork (2026): provide Sessions and Debugging tabs without legacy settings.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -15,7 +15,6 @@ limitations under the License.
 package com.nccgroup.jwtreauth;
 
 import burp.ITab;
-import com.nccgroup.jwtreauth.ui.MainViewPane;
 
 import javax.swing.*;
 import java.awt.*;
@@ -26,8 +25,7 @@ public class MainViewController implements ITab {
     public MainViewController(JWTReauth jwtReauth) {
         tabbedPane = new JTabbedPane();
         tabbedPane.addTab("Sessions", jwtReauth.getSessionProfilesPanel());
-        tabbedPane.addTab("Legacy settings", new MainViewPane(jwtReauth));
-        tabbedPane.addTab("Scope", jwtReauth.getScopeController().getScopePanel());
+        tabbedPane.addTab("Debugging", new com.nccgroup.jwtreauth.ui.RequestDebugPanel(jwtReauth));
     }
 
     @Override

@@ -40,12 +40,6 @@ tasks.withType(Jar) {
 }
 
 // These assertion-based checks run without a test framework or network services.
-tasks.register('templateChecks', JavaExec) {
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.nccgroup.jwtreauth.ReauthTemplateTest'
-    enableAssertions = true
-}
 tasks.register('profileChecks', JavaExec) {
     dependsOn testClasses
     classpath = sourceSets.test.runtimeClasspath
@@ -53,4 +47,4 @@ tasks.register('profileChecks', JavaExec) {
     enableAssertions = true
     systemProperty 'java.awt.headless', 'true'
 }
-check.dependsOn templateChecks, profileChecks
+check.dependsOn profileChecks

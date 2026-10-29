@@ -31,6 +31,8 @@ public final class SessionProfiles implements IExtensionStateListener {
     private final Map<String, Entry> entries = new LinkedHashMap<>();
     private final ThreadLocal<Boolean> renewing = ThreadLocal.withInitial(() -> false);
     private volatile boolean closed;
+    private final RequestDebugLog debugLog = new RequestDebugLog();
+    public RequestDebugLog getDebugLog() { return debugLog; }
     private final ConcurrentHashMap<String, Integer> inFlight = new ConcurrentHashMap<>();
     private static final class Entry {
         final SessionProfile profile;
@@ -58,6 +60,19 @@ public final class SessionProfiles implements IExtensionStateListener {
             entry.schedule = workers.scheduleWithFixedDelay(() -> renew(entry), 0, profile.interval, TimeUnit.SECONDS);
         }
     }
+    /** Merge a fully validated file; imported values replace same-name profile state. */
+    public synchronized void loadProfiles(List<SessionProfile> profiles) {
+        if (closed) throw new IllegalStateException("Extension unloaded");
+        Set<String> names = new HashSet<>();
+        for (SessionProfile profile : profiles) {
+            Objects.requireNonNull(profile);
+            if (!names.add(profile.name)) throw new IllegalArgumentException("Duplicate profile: " + profile.name);
+        }
+        for (SessionProfile profile : profiles) {
+            remove(profile.name);
+            save(profile, null);
+        }
+    }
     public synchronized void remove(String name) {
         Entry entry = entries.remove(name);
         if (entry != null && entry.schedule != null) entry.schedule.cancel(false);
@@ -76,35 +91,47 @@ public final class SessionProfiles implements IExtensionStateListener {
         if (!active(entry)) { entry.busy.set(false); return; }
         SessionProfile profile = entry.profile;
         profile.status = "Renewing";
-        String flightKey = null;
+        String flightKey = null, targetKey = null;
+        String requestText = "", responseText = "";
+        Map<String, String> previousValues = profile.snapshot();
         try {
             renewing.set(true);
             byte[] raw = helpers.stringToBytes(profile.render());
-            IRequestInfo info = helpers.analyzeRequest(raw);
-            List<String> headers = new ArrayList<>(info.getHeaders());
-            headers.removeIf(h -> h.regionMatches(true, 0, MARKER + ":", 0, MARKER.length() + 1));
-            byte[] request = helpers.buildHttpMessage(headers, Arrays.copyOfRange(raw, info.getBodyOffset(), raw.length));
             IHttpService service = helpers.buildHttpService(profile.endpoint.getHost(), SessionProfile.port(profile.endpoint), profile.endpoint.getProtocol());
-            flightKey = fingerprint(service, request);
+            ReauthHttpClient client = new ReauthHttpClient(extension.getCallbacks());
+            ReauthHttpClient.Prepared prepared = client.prepare(service, raw, profile.protocol);
+            requestText = helpers.bytesToString(prepared.request);
+            flightKey = fingerprint(service, prepared.request);
             inFlight.merge(flightKey, 1, Integer::sum);
-            IHttpRequestResponse response = extension.getCallbacks().makeHttpRequest(service, request);
-            if (response == null || response.getResponse() == null) throw new IllegalArgumentException("No HTTP response");
-            int status = helpers.analyzeResponse(response.getResponse()).getStatusCode();
+            targetKey = targetFingerprint(service, prepared.request);
+            inFlight.merge(targetKey, 1, Integer::sum);
+            byte[] response = client.send(service, prepared);
+            if (response == null) throw new IllegalArgumentException("No HTTP response");
+            responseText = helpers.bytesToString(response);
+            int status = helpers.analyzeResponse(response).getStatusCode();
             if (status < 200 || status >= 300) throw new IllegalArgumentException("HTTP " + status);
-            if (!active(entry)) return;
+            if (!active(entry)) {
+                debugLog.add("Renewal", profile.name, profile.endpoint.toString(), "Discarded result: profile deleted or replaced", requestText, requestText, responseText);
+                return;
+            }
             Map<String, String> before = profile.snapshot();
-            profile.accept(helpers.bytesToString(response.getResponse()));
+            profile.accept(responseText);
             List<String> results = new ArrayList<>();
             profile.snapshot().forEach((name, value) -> results.add(name + (Objects.equals(before.get(name), value) ? " unchanged" : " updated")));
             profile.lastSuccess = Instant.now();
-            profile.status = "Ready — " + String.join(", ", results) + " (values masked)";
+            profile.status = "Ready — " + String.join(", ", results);
+            debugLog.add("Renewal", profile.name, profile.endpoint.toString(), profile.status, requestText, requestText,
+                    "Protocol: " + prepared.description() + "\nPrevious variables: " + previousValues + "\nCurrent variables: " + profile.snapshot() + "\n\nResponse:\n" + responseText);
         } catch (RuntimeException ex) {
             // Do not include exception messages from parsers or HTTP helpers: they may contain secrets.
             profile.status = "Failed — " + (ex instanceof com.google.gson.JsonParseException ? "malformed JSON; previous values retained" : ex instanceof IllegalArgumentException && ex.getMessage() != null &&
                     (ex.getMessage().startsWith("Missing response value:") || ex.getMessage().startsWith("Invalid value for destination:") || ex.getMessage().startsWith("HTTP ") || ex.getMessage().equals("No HTTP response"))
                     ? ex.getMessage() : "invalid response or request; previous values retained");
+            debugLog.add("Renewal", profile.name, profile.endpoint.toString(), profile.status, requestText, requestText,
+                    "Retained variables: " + profile.snapshot() + "\n" + ex.toString() + "\nProtocol: " + profile.protocol + "\n\nResponse:\n" + responseText);
         } finally {
             if (flightKey != null) inFlight.computeIfPresent(flightKey, (key, count) -> count == 1 ? null : count - 1);
+            if (targetKey != null) inFlight.computeIfPresent(targetKey, (key, count) -> count == 1 ? null : count - 1);
             renewing.remove();
             profile.nextRenewal = profile.enabled ? Instant.now().plusSeconds(profile.interval) : null;
             entry.busy.set(false);
@@ -113,6 +140,12 @@ public final class SessionProfiles implements IExtensionStateListener {
     /** Returns true when a profile owns this request, including conflicts and unknown markers. */
     public boolean process(boolean isRequest, IHttpRequestResponse message) {
         if (!isRequest) return false;
+        // A native HTTP/2 renewal must not pass through the legacy byte-array
+        // view. Burp may normalize a kettled request when getRequest() is called,
+        // including removing pseudo-headers. Its actual request is already
+        // recorded by runRenewal(), so bypass before reading or analyzing it.
+        if (renewing.get()) return true;
+        byte[] original = message.getRequest().clone();
         IRequestInfo info = helpers.analyzeRequest(message);
         List<String> headers = new ArrayList<>(info.getHeaders());
         List<String> markers = new ArrayList<>();
@@ -127,22 +160,36 @@ public final class SessionProfiles implements IExtensionStateListener {
         if (!markers.isEmpty()) message.setRequest(helpers.buildHttpMessage(headers, body));
         URL url = info.getUrl();
         List<SessionProfile> profiles = list();
-        if (renewing.get() || inFlight.containsKey(fingerprint(message.getHttpService(), message.getRequest())) || profiles.stream().anyMatch(p -> SessionProfile.sameOrigin(p.endpoint, url)
-                && p.endpoint.getPath().equals(url.getPath()))) return true;
+        if (renewing.get() || inFlight.containsKey(fingerprint(message.getHttpService(), message.getRequest()))
+                || inFlight.containsKey(targetFingerprint(message.getHttpService(), message.getRequest())) || profiles.stream().anyMatch(p -> SessionProfile.sameOrigin(p.endpoint, url)
+                && p.endpoint.getPath().equals(url.getPath()))) {
+            recordRequest("", url, "Renewal/authentication request: credential injection bypassed", original, message);
+            return true;
+        }
         List<SessionProfile> matches = new ArrayList<>();
         for (SessionProfile p : profiles) {
             if (p.enabled && p.matches(url) && (markers.isEmpty() ? p.autoMatch : markers.size() == 1 && p.name.equals(markers.get(0)))) matches.add(p);
         }
         if (matches.size() != 1) {
             if (!markers.isEmpty() || matches.size() > 1) {
-                extension.getLogController().info("Session profile selection failed: unknown, disabled, outside scope, or ambiguous profile. Credentials were not injected.");
+                String reason;
+                if (markers.size() > 1) reason = "Multiple profile markers; credentials not injected";
+                else if (!markers.isEmpty()) {
+                    SessionProfile named = profiles.stream().filter(p -> p.name.equals(markers.get(0))).findFirst().orElse(null);
+                    reason = named == null ? "Unknown profile; credentials not injected" : !named.enabled ? "Profile disabled; credentials not injected" : "Outside profile scope; credentials not injected";
+                } else reason = "Ambiguous profiles: " + matches.stream().map(p -> p.name).collect(java.util.stream.Collectors.joining(", ")) + "; credentials not injected";
+                extension.getLogController().info("%s", reason);
+                recordRequest(String.join(", ", markers), url, reason, original, message);
                 return true;
             }
+            debugLog.add("Routing", "", url.toString(), "No enabled session profile matched; request unchanged",
+                    helpers.bytesToString(original), helpers.bytesToString(message.getRequest()), "No enabled profile selected by marker or automatic scope matching.");
             return false;
         }
         SessionProfile profile = matches.get(0);
         if (profile.lastSuccess == null) {
             extension.getLogController().info("Session profile has no successful renewal yet; credentials were not injected.");
+            recordRequest(profile.name, url, "No successful renewal yet; credentials not injected", original, message);
             return true;
         }
         Map<String, String> values = profile.snapshot();
@@ -168,7 +215,30 @@ public final class SessionProfiles implements IExtensionStateListener {
             List<String> pairs = new ArrayList<>(); cookies.forEach((k, v) -> pairs.add(k + "=" + v));
             headers.add("Cookie: " + String.join("; ", pairs));
         }
-        message.setRequest(helpers.buildHttpMessage(headers, body)); return true;
+        message.setRequest(helpers.buildHttpMessage(headers, body));
+        recordRequest(profile.name, url, "Applied profile via " + (markers.isEmpty() ? "scope" : "marker"), original, message);
+        return true;
+    }
+    public void recordRequest(String profile, URL url, String reason, byte[] before, IHttpRequestResponse message) {
+        String original = helpers.bytesToString(before), updated = helpers.bytesToString(message.getRequest());
+        StringBuilder changes = new StringBuilder();
+        List<String> oldHeaders = new ArrayList<>(Arrays.asList(original.split("\r\n\r\n", 2)[0].split("\r\n")));
+        List<String> newHeaders = new ArrayList<>(Arrays.asList(updated.split("\r\n\r\n", 2)[0].split("\r\n")));
+        for (String header : new ArrayList<>(oldHeaders)) if (newHeaders.remove(header)) oldHeaders.remove(header);
+        for (String header : oldHeaders) changes.append("Removed: ").append(header).append("\n");
+        for (String header : newHeaders) changes.append("Added: ").append(header).append("\n");
+        if (original.equals(updated)) changes.append("Request unchanged.\n");
+        debugLog.add("Request", profile, url.toString(), reason, original, updated, changes.toString());
+    }
+    private String targetFingerprint(IHttpService service, byte[] request) {
+        String[] line = helpers.bytesToString(request).split("\r\n", 2)[0].split(" ", 3);
+        String target = line.length > 1 ? line[1] : "";
+        if (target.startsWith("http://") || target.startsWith("https://")) {
+            java.net.URI uri = java.net.URI.create(target);
+            target = uri.getRawPath().isEmpty() ? "/" : uri.getRawPath();
+            if (uri.getRawQuery() != null) target += "?" + uri.getRawQuery();
+        }
+        return "target:" + service.getProtocol() + "://" + service.getHost().toLowerCase(Locale.ROOT) + ":" + service.getPort() + ":" + line[0] + ":" + target;
     }
     private static String fingerprint(IHttpService service, byte[] request) {
         try {

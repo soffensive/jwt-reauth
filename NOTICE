@@ -10,7 +10,8 @@ https://github.com/soffensive/jwt-reauth
 
 Changes in this fork (2026) include custom re-authentication HTTP templates,
 response extraction, independent concurrent session profiles, a Sessions UI,
-automated checks, and packaging of runtime dependencies and license notices.
+request debugging, local profile files, protocol selection, automated checks,
+and packaging of runtime dependencies and license notices.
 NCC Group does not endorse this fork.
 
 Bundled third-party components and their license texts are identified in

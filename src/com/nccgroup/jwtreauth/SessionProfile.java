@@ -78,6 +78,7 @@ public final class SessionProfile {
     public final String name, request;
     public final URL endpoint, scope;
     public final int interval;
+    public final ReauthHttpClient.Protocol protocol;
     public final List<Rule> rules;
     public final boolean enabled, autoMatch;
     private volatile Map<String, String> values;
@@ -87,6 +88,11 @@ public final class SessionProfile {
 
     public SessionProfile(String name, URL endpoint, URL scope, String request, int interval,
                           List<Rule> rules, boolean enabled, boolean autoMatch) {
+        this(name, endpoint, scope, request, interval, rules, enabled, autoMatch, ReauthHttpClient.Protocol.AUTO);
+    }
+    public SessionProfile(String name, URL endpoint, URL scope, String request, int interval,
+                          List<Rule> rules, boolean enabled, boolean autoMatch, ReauthHttpClient.Protocol protocol) {
+        this.protocol = Objects.requireNonNull(protocol);
         if (!name.matches("[A-Za-z0-9_-]+")) throw new IllegalArgumentException("Profile name must use letters, digits, underscores, or hyphens.");
         for (URL url : Arrays.asList(endpoint, scope)) {
             if (!(url.getProtocol().equals("http") || url.getProtocol().equals("https")) || url.getHost().isEmpty())
@@ -94,8 +100,7 @@ public final class SessionProfile {
         }
         if (interval < 5) throw new IllegalArgumentException("Renewal interval must be at least 5 seconds.");
         this.request = request.replace("\r\n", "\n").replace("\n", "\r\n");
-        if (!this.request.matches("(?s)[A-Z]+ [^\\r\\n]+ HTTP/1\\.[01]\\r\\n.*") || !this.request.contains("\r\n\r\n"))
-            throw new IllegalArgumentException("Enter a complete HTTP/1 request, including a blank line after headers.");
+        ReauthHttpClient.validate(this.request);
         this.name = name; this.endpoint = endpoint; this.scope = scope; this.interval = interval;
         this.rules = Collections.unmodifiableList(new ArrayList<>(rules)); this.enabled = enabled; this.autoMatch = autoMatch;
         Map<String, String> initial = new LinkedHashMap<>();
@@ -119,6 +124,18 @@ public final class SessionProfile {
     }
     public static int port(URL url) { return url.getPort() < 0 ? url.getDefaultPort() : url.getPort(); }
     public Map<String, String> snapshot() { return values; }
+    void restoreValues(Map<String, String> saved) {
+        if (!saved.keySet().equals(values.keySet()) || saved.values().stream().anyMatch(Objects::isNull))
+            throw new IllegalArgumentException("Saved variables must match the extraction rules.");
+        for (Rule rule : rules) {
+            String value = saved.get(rule.variable);
+            if (rule.destination != Destination.VARIABLE && (value.contains("\r") || value.contains("\n") ||
+                    (rule.destination == Destination.COOKIE && value.contains(";"))))
+                throw new IllegalArgumentException("Invalid saved value: " + rule.variable);
+        }
+        values = Collections.unmodifiableMap(new LinkedHashMap<>(saved));
+        status = "Ready — loaded values; renewal required";
+    }
     void inheritValues(SessionProfile previous) {
         Map<String, String> inherited = new LinkedHashMap<>(values);
         Map<String, String> oldValues = previous.snapshot();

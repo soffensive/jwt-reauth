@@ -26,7 +26,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class SessionProfilesTest {
     private static final String RESPONSE = "HTTP/1.1 200 OK\r\nSet-Cookie: session=new-cookie; Path=/\r\nX-CSRF: csrf-value\r\n\r\n{\"data\":{\"access_token\":\"new-token\"},\"refresh_token\":\"rotated\"}";
     public static void main(String[] args) throws Exception {
-        extraction(); routing(); concurrency(); startup();
+        extraction(); routing(); concurrency(); protocols(); persistence(); debugHistory(); startup();
         System.out.println("Session profile extraction, routing, and concurrency tests passed");
     }
     private static void startup() throws Exception {
@@ -36,11 +36,17 @@ public final class SessionProfilesTest {
             javax.swing.SwingUtilities.invokeAndWait(() -> extension.registerExtenderCallbacks(fixture.callbacks));
             assert extension.getSessionProfiles() != null;
             assert extension.getSessionProfilesPanel() != null;
+            javax.swing.SwingUtilities.invokeAndWait(() -> {
+                javax.swing.JTabbedPane tabs = (javax.swing.JTabbedPane)new MainViewController(extension).getUiComponent();
+                assert tabs.getTabCount() == 2 && tabs.getTitleAt(0).equals("Sessions") && tabs.getTitleAt(1).equals("Debugging");
+            });
+            IContextMenuInvocation invocation = proxy(IContextMenuInvocation.class, (p, m, a) ->
+                    m.getName().equals("getInvocationContext") ? IContextMenuInvocation.CONTEXT_PROXY_HISTORY : null);
+            assert new JWTReauthContextMenuFactory(extension).createMenuItems(invocation).size() == 1;
         } finally {
+            for (IExtensionStateListener listener : fixture.listeners) listener.extensionUnloaded();
             if (extension.getSessionProfiles() != null) extension.getSessionProfiles().extensionUnloaded();
             if (extension.getSessionProfilesPanel() != null) extension.getSessionProfilesPanel().extensionUnloaded();
-            if (extension.getTokenListener() != null) extension.getTokenListener().extensionUnloaded();
-            if (extension.getTokenListenerStatePanel() != null) extension.getTokenListenerStatePanel().extensionUnloaded();
         }
     }
     private static SessionProfile profile(String name, boolean enabled, boolean automatic) throws Exception {
@@ -88,19 +94,33 @@ public final class SessionProfilesTest {
             assert !rendered.contains("X-Reauth-Profile");
             assert rendered.contains("Authorization: Bearer new-token");
             assert rendered.contains("unrelated=keep; session=new-cookie");
+            RequestDebugLog.Event changed = latest(profiles);
+            assert changed.changed && changed.profile.equals("alice");
+            assert changed.before.contains("Authorization: old");
+            assert changed.after.contains("Authorization: Bearer new-token");
+            assert changed.details.contains("Removed: X-Reauth-Profile: alice");
+            assert changed.details.contains("Added: Authorization: Bearer new-token");
+            assert changed.reason.contains("marker");
             IHttpRequestResponse conflict = f.message("GET /api/users HTTP/1.1\r\nHost: example.test\r\n\r\n");
             assert profiles.process(true, conflict);
             assert !string(conflict.getRequest()).contains("Authorization:");
+            assert !latest(profiles).changed && latest(profiles).reason.contains("Ambiguous");
             IHttpRequestResponse unknown = f.message("GET /api/users HTTP/1.1\r\nHost: example.test\r\nX-Reauth-Profile: unknown\r\n\r\n");
             assert profiles.process(true, unknown);
             assert !string(unknown.getRequest()).contains("X-Reauth-Profile");
             assert !string(unknown.getRequest()).contains("Authorization:");
+            assert latest(profiles).changed && latest(profiles).reason.contains("Unknown");
             IHttpRequestResponse outside = f.message("GET /outside HTTP/1.1\r\nHost: example.test\r\nX-Reauth-Profile: alice\r\n\r\n");
             assert profiles.process(true, outside);
             assert !string(outside.getRequest()).contains("Authorization:");
             profiles.remove("bob");
             assert profiles.process(true, conflict);
             assert string(conflict.getRequest()).contains("Authorization: Bearer new-token");
+            assert latest(profiles).reason.contains("scope");
+            assert profiles.process(true, conflict);
+            assert !latest(profiles).changed : "Already-correct credentials should report no change";
+            assert profiles.getDebugLog().snapshot().stream().anyMatch(event -> event.kind.equals("Renewal")
+                    && event.details.contains("new-token") && event.details.contains("Response:"));
             profiles.remove("alice");
             assert !profiles.process(true, f.message("GET /api HTTP/1.1\r\nHost: example.test\r\n\r\n"));
         } finally { profiles.extensionUnloaded(); }
@@ -114,6 +134,8 @@ public final class SessionProfilesTest {
             profiles.test("alice"); profiles.test("bob");
             assert f.started.await(3, TimeUnit.SECONDS) : "Profiles must renew concurrently";
             assert profiles.process(true, f.message(f.sentRequests.peek())) : "Renewal traffic must bypass injection even on another listener thread and a custom path";
+            assert profiles.process(true, f.message(f.sentRequests.peek().replace("HTTP/1.1", "HTTP/2")))
+                    : "Burp's negotiated protocol representation must not break renewal isolation";
             profiles.test("alice");
             // Probe another worker to ensure the duplicate renewal task had time to run.
             profiles.test("bob");
@@ -124,6 +146,125 @@ public final class SessionProfilesTest {
             assert alice.lastSuccess == null : "Deleted profile must not publish an in-flight result";
             assert f.calls.get() == 2 : "A profile must not overlap its own renewals";
         } finally { f.release.countDown(); profiles.extensionUnloaded(); }
+    }
+    private static void protocols() throws Exception {
+        Fixture f = new Fixture();
+        ReauthHttpClient client = new ReauthHttpClient(f.callbacks);
+        byte[] request = bytes("POST /refresh?q=1 HTTP/2\r\nHost: virtual.test:8443\r\nConnection: keep-alive, X-Hop\r\nX-Hop: discard\r\nCookie: session=seed; csrf=first==; duplicate=one\r\ncookie: duplicate=two; empty=; quoted=\"a=b\"\r\nContent-Length: 999\r\n\r\ntoken=seed");
+        ReauthHttpClient.Prepared h2 = client.prepare(f.service, request, ReauthHttpClient.Protocol.AUTO);
+        assert h2.http2;
+        List<String> pseudoOrder = new ArrayList<>();
+        h2.headers.stream().filter(h -> h.getName().startsWith(":" )).forEach(h -> pseudoOrder.add(h.getName()));
+        assert pseudoOrder.equals(Arrays.asList(":scheme", ":method", ":path", ":authority"))
+                : "Burp marks valid-but-reordered scheme/method pseudo-headers as kettled";
+        Map<String, String> headers = new HashMap<>(); h2.headers.forEach(h -> headers.put(h.getName(), h.getValue()));
+        assert headers.get(":method").equals("POST");
+        assert headers.get(":path").equals("/refresh?q=1");
+        assert headers.get(":scheme").equals("https");
+        assert headers.get(":authority").equals("virtual.test:8443");
+        assert headers.get("content-length").equals("10");
+        assert !headers.containsKey("connection") && !headers.containsKey("x-hop") && !headers.containsKey("host");
+        List<String> crumbs = new ArrayList<>();
+        h2.headers.stream().filter(h -> h.getName().equals("cookie")).forEach(h -> crumbs.add(h.getValue()));
+        assert crumbs.equals(Arrays.asList("session=seed", "csrf=first==", "duplicate=one", "duplicate=two", "empty=", "quoted=\"a=b\""));
+        assert h2.headers.stream().filter(h -> h.getName().equals("cookie")).noneMatch(h -> h.getValue().contains("; "));
+        assert string(client.send(f.service, h2)).equals(RESPONSE) && f.http2Calls.get() == 1;
+        ReauthHttpClient.Prepared spaced = client.prepare(f.service,
+                bytes("GET / HTTP/2\r\nHost: example.test\r\nX-Test : value\r\n\r\n"), ReauthHttpClient.Protocol.HTTP_2);
+        assert spaced.headers.stream().anyMatch(h -> h.getName().equals("x-test") && h.getValue().equals("value"));
+        for (String invalid : Arrays.asList("X Invalid: value", "X-Test: bad\u0000value", "X-Test: bad\nvalue")) {
+            try {
+                client.prepare(f.service, bytes("GET / HTTP/2\r\nHost: example.test\r\n" + invalid + "\r\n\r\n"), ReauthHttpClient.Protocol.HTTP_2);
+                throw new AssertionError("Invalid header accepted");
+            } catch (IllegalArgumentException expected) { }
+        }
+        ReauthHttpClient.Prepared automatic = client.prepare(f.service, bytes("GET / HTTP/1.1\r\nHost: example.test\r\n\r\n"), ReauthHttpClient.Protocol.AUTO);
+        assert !automatic.http2 && !automatic.forceHttp1;
+        client.send(f.service, automatic); assert Boolean.FALSE.equals(f.lastForceHttp1);
+        ReauthHttpClient.Prepared h1 = client.prepare(f.service, request, ReauthHttpClient.Protocol.HTTP_1);
+        assert !h1.http2 && h1.forceHttp1 && string(h1.request).startsWith("POST /refresh?q=1 HTTP/1.1");
+        client.send(f.service, h1); assert Boolean.TRUE.equals(f.lastForceHttp1);
+        assert client.prepare(f.service, bytes("GET / HTTP/1.0\r\n\r\n"), ReauthHttpClient.Protocol.AUTO).forceHttp1;
+        ReauthHttpClient.Prepared forced = client.prepare(f.service, bytes("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n0\r\n\r\n"), ReauthHttpClient.Protocol.HTTP_2);
+        assert string(forced.body).equals("test");
+        for (String version : Arrays.asList("HTTP/1.0", "HTTP/1.1", "HTTP/2", "HTTP/2.0")) {
+            SessionProfile p = profile("version", false, false);
+            new SessionProfile(p.name, p.endpoint, p.scope, p.request.replace("HTTP/1.1", version), p.interval, p.rules, false, false);
+        }
+        SessionProfiles profiles = new SessionProfiles(f.extension);
+        try {
+            SessionProfile p = profile("http2", false, false);
+            SessionProfile h2Profile = new SessionProfile(p.name, p.endpoint, p.scope, p.request.replace("HTTP/1.1", "HTTP/2"), p.interval, p.rules, false, false);
+            f.http2Listener = profiles;
+            profiles.save(h2Profile, null); profiles.test(h2Profile.name);
+            await(() -> h2Profile.lastSuccess != null);
+            assert h2Profile.snapshot().get("token").equals("new-token");
+            assert h2Profile.render().endsWith("refresh=rotated");
+        } finally { profiles.extensionUnloaded(); }
+    }
+    private static void persistence() throws Exception {
+        java.nio.file.Path directory = java.nio.file.Files.createTempDirectory("jwt-profiles-test-");
+        java.nio.file.Path file = directory.resolve("profiles.json");
+        Fixture fixture = new Fixture(); SessionProfiles manager = new SessionProfiles(fixture.extension);
+        try {
+            SessionProfile seed = profile("saved", false, true);
+            SessionProfile original = new SessionProfile(seed.name, seed.endpoint, seed.scope,
+                    seed.request.replace("HTTP/1.1", "HTTP/2"), seed.interval, seed.rules, true, true, ReauthHttpClient.Protocol.HTTP_2);
+            original.accept(RESPONSE);
+            ProfileStore.save(file, Arrays.asList(original, profile("other", false, false)));
+            List<SessionProfile> restored = ProfileStore.load(file);
+            assert restored.size() == 2;
+            SessionProfile p = restored.get(0);
+            assert p.name.equals(original.name) && p.endpoint.equals(original.endpoint) && p.scope.equals(original.scope);
+            assert p.request.equals(original.request) && p.interval == original.interval && p.autoMatch && p.enabled;
+            assert p.protocol == ReauthHttpClient.Protocol.HTTP_2;
+            assert p.rules.size() == 3 && p.rules.get(1).prefix.equals("Bearer ");
+            assert p.rules.get(0).source == SessionProfile.Source.COOKIE;
+            assert p.rules.get(1).destination == SessionProfile.Destination.HEADER;
+            assert p.rules.get(0).initial.equals("saved");
+            assert p.snapshot().equals(original.snapshot()) && p.render().endsWith("refresh=rotated");
+            assert p.lastSuccess == null : "Restored credentials require renewal before injection";
+            manager.save(profile("untouched", false, false), null);
+            manager.save(profile("saved", false, false), null);
+            manager.loadProfiles(restored);
+            await(() -> p.lastSuccess != null);
+            assert manager.list().size() == 3;
+            assert manager.list().stream().filter(v -> v.name.equals("saved")).findFirst().get().snapshot().get("refresh").equals("rotated");
+            String json = java.nio.file.Files.readString(file);
+            java.nio.file.Files.writeString(file, json.replace("\"schemaVersion\": 1", "\"schemaVersion\": 99"));
+            try { ProfileStore.load(file); throw new AssertionError("Unknown schema accepted"); }
+            catch (java.io.IOException expected) { }
+            java.nio.file.Files.writeString(file, json.replace("\"interval\": 3600", "\"interval\": 0"));
+            try { manager.loadProfiles(ProfileStore.load(file)); throw new AssertionError("Invalid profile accepted"); }
+            catch (java.io.IOException expected) { assert manager.list().size() == 3; }
+            java.nio.file.Files.writeString(file, json.replace("\"HTTP_2\"", "\"UNKNOWN\""));
+            try { ProfileStore.load(file); throw new AssertionError("Invalid protocol accepted"); }
+            catch (java.io.IOException expected) { }
+            java.nio.file.Files.writeString(file, "{broken");
+            try { ProfileStore.load(file); throw new AssertionError("Malformed file accepted"); }
+            catch (java.io.IOException expected) { }
+            ProfileStore.save(file, java.util.Collections.emptyList());
+            assert ProfileStore.load(file).isEmpty();
+        } finally {
+            manager.extensionUnloaded(); java.nio.file.Files.deleteIfExists(file); java.nio.file.Files.deleteIfExists(directory);
+        }
+    }
+    private static RequestDebugLog.Event latest(SessionProfiles profiles) {
+        List<RequestDebugLog.Event> events = profiles.getDebugLog().snapshot();
+        return events.stream().filter(event -> event.kind.equals("Request") || event.kind.equals("Routing"))
+                .reduce((previous, current) -> current).orElseThrow(AssertionError::new);
+    }
+    private static void debugHistory() {
+        RequestDebugLog log = new RequestDebugLog();
+        for (int i = 0; i < RequestDebugLog.MAX_EVENTS + 20; i++)
+            log.add("Request", "alice", "https://example.test/", "Test", "old", "new", "");
+        assert log.snapshot().size() == RequestDebugLog.MAX_EVENTS;
+        assert log.snapshot().get(0).id == 21;
+        log.add("Request", "alice", "", "Long request", "x".repeat(RequestDebugLog.MAX_TEXT + 1), "x".repeat(RequestDebugLog.MAX_TEXT) + "y", "");
+        RequestDebugLog.Event event = log.snapshot().get(RequestDebugLog.MAX_EVENTS - 1);
+        assert event.changed : "Compare full requests before truncating the display";
+        assert event.before.contains("Display truncated");
+        log.clear(); assert log.snapshot().isEmpty();
     }
     private static SessionProfile differentRenewalPath(String name) throws Exception {
         SessionProfile p = profile(name, false, false);
@@ -141,8 +282,12 @@ public final class SessionProfilesTest {
     private static byte[] bytes(String s) { return s.getBytes(StandardCharsets.ISO_8859_1); }
     private static String string(byte[] bytes) { return new String(bytes, StandardCharsets.ISO_8859_1); }
     private static final class Fixture {
+        final List<IExtensionStateListener> listeners = new CopyOnWriteArrayList<>();
         final ConcurrentLinkedQueue<String> sentRequests = new ConcurrentLinkedQueue<>();
         final AtomicInteger calls = new AtomicInteger(), concurrent = new AtomicInteger(), maxConcurrent = new AtomicInteger();
+        final AtomicInteger http2Calls = new AtomicInteger();
+        volatile Boolean lastForceHttp1;
+        volatile SessionProfiles http2Listener;
         volatile CountDownLatch started, release;
         volatile String responseText = RESPONSE;
         final IHttpService service = proxy(IHttpService.class, (p, m, a) -> {
@@ -153,6 +298,7 @@ public final class SessionProfilesTest {
                 case "stringToBytes": return bytes((String)a[0]);
                 case "bytesToString": return string((byte[])a[0]);
                 case "buildHttpService": return service;
+                case "buildHeader": return proxy(IHttpHeader.class, (q, method, args) -> method.getName().equals("getName") ? a[0] : a[1]);
                 case "analyzeResponse": return proxy(IResponseInfo.class, (q, method, args) -> method.getName().equals("getStatusCode") ? (short)200 : null);
                 case "analyzeRequest": {
                     byte[] raw = a[0] instanceof byte[] ? (byte[])a[0] : ((IHttpRequestResponse)a[0]).getRequest();
@@ -175,7 +321,34 @@ public final class SessionProfilesTest {
         });
         final IBurpExtenderCallbacks callbacks = proxy(IBurpExtenderCallbacks.class, (p, m, a) -> {
             if (m.getName().equals("getHelpers")) return helpers;
+            if (m.getName().equals("registerExtensionStateListener")) { listeners.add((IExtensionStateListener)a[0]); return null; }
+            if (m.getName().equals("makeHttp2Request")) {
+                assert a.length == 4 && Boolean.TRUE.equals(a[3]);
+                @SuppressWarnings("unchecked") List<IHttpHeader> fields = (List<IHttpHeader>)a[1];
+                for (IHttpHeader field : fields) {
+                    assert field.getName().startsWith(":") || field.getName().matches("[!#$%&'*+.^_`|~0-9a-z-]+") : "Header cannot be represented normally";
+                    assert !field.getName().equals("cookie") || !field.getValue().contains("; ") : "Combined cookie field would kettle the request";
+                }
+                if (http2Listener != null) {
+                    List<String> before = new ArrayList<>(); fields.forEach(h -> before.add(h.getName() + "=" + h.getValue()));
+                    IHttpRequestResponse nativeMessage = proxy(IHttpRequestResponse.class, (q, method, args) -> {
+                        throw new AssertionError("Native HTTP/2 renewal must bypass all legacy message access: " + method.getName());
+                    });
+                    assert http2Listener.process(true, nativeMessage);
+                    List<String> after = new ArrayList<>(); fields.forEach(h -> after.add(h.getName() + "=" + h.getValue()));
+                    assert before.equals(after) : "Renewal pseudo-headers must remain untouched";
+                }
+                assert fields.stream().filter(h -> h.getName().equals(":method")).count() == 1;
+                if (fields.stream().noneMatch(h -> h.getName().equals(":method") && h.getValue().equals("CONNECT"))) {
+                    assert fields.stream().filter(h -> h.getName().equals(":scheme")).count() == 1;
+                    List<String> order = new ArrayList<>();
+                    fields.stream().filter(h -> h.getName().startsWith(":" )).forEach(h -> order.add(h.getName()));
+                    assert order.equals(Arrays.asList(":scheme", ":method", ":path", ":authority"));
+                }
+                http2Calls.incrementAndGet(); return bytes(responseText);
+            }
             if (!m.getName().equals("makeHttpRequest")) return null;
+            if (a.length == 3) lastForceHttp1 = (Boolean)a[2];
             sentRequests.add(string((byte[])a[1]));
             calls.incrementAndGet(); int count = concurrent.incrementAndGet(); maxConcurrent.accumulateAndGet(count, Math::max);
             try {
