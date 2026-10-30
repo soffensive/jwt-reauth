@@ -26,7 +26,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class SessionProfilesTest {
     private static final String RESPONSE = "HTTP/1.1 200 OK\r\nSet-Cookie: session=new-cookie; Path=/\r\nX-CSRF: csrf-value\r\n\r\n{\"data\":{\"access_token\":\"new-token\"},\"refresh_token\":\"rotated\"}";
     public static void main(String[] args) throws Exception {
-        extraction(); routing(); concurrency(); protocols(); persistence(); debugHistory(); startup();
+        workflow(); extraction(); routing(); concurrency(); protocols(); persistence(); debugHistory(); startup();
         System.out.println("Session profile extraction, routing, and concurrency tests passed");
     }
     private static void startup() throws Exception {
@@ -116,7 +116,10 @@ public final class SessionProfilesTest {
             assert !string(inactiveRequest.getRequest()).contains("Authorization:");
             IContextMenuInvocation invocation = proxy(IContextMenuInvocation.class, (p, m, a) ->
                     m.getName().equals("getInvocationContext") ? IContextMenuInvocation.CONTEXT_PROXY_HISTORY : null);
-            assert new JWTReauthContextMenuFactory(extension).createMenuItems(invocation).size() == 1;
+            List<javax.swing.JMenuItem> menu = new JWTReauthContextMenuFactory(extension).createMenuItems(invocation);
+            assert menu.size() == 3;
+            assert menu.stream().anyMatch(item -> item.getText().contains("set refresh request"));
+            assert menu.stream().anyMatch(item -> item.getText().contains("set login request"));
         } finally {
             for (IExtensionStateListener listener : fixture.listeners) listener.extensionUnloaded();
             if (extension.getSessionProfiles() != null) extension.getSessionProfiles().extensionUnloaded();
@@ -143,6 +146,29 @@ public final class SessionProfilesTest {
                     new SessionProfile.Rule("session", SessionProfile.Source.COOKIE, "session", name, SessionProfile.Destination.COOKIE, "session"),
                     new SessionProfile.Rule("token", SessionProfile.Source.JSON, "data.access_token", "old-token", SessionProfile.Destination.HEADER, "Authorization", "Bearer "),
                     new SessionProfile.Rule("refresh", SessionProfile.Source.JSON, "refresh_token", "seed-" + name, SessionProfile.Destination.VARIABLE, "")), enabled, automatic);
+    }
+    private static void workflow() throws Exception {
+        Fixture f = new Fixture(); SessionProfiles manager = new SessionProfiles(f.extension);
+        java.nio.file.Path file = java.nio.file.Files.createTempFile("workflow", ".json");
+        try {
+            SessionProfile p = profile("workflow", false, false);
+            p.configureWorkflow("POST /login HTTP/1.1\r\nHost: example.test\r\n\r\nuser=alice", new URL("https://example.test/login"),
+                    "EXACT https://example.test/one\nSUBTREE https://example.test/two");
+            assert p.matches(new URL("https://example.test/one"));
+            assert !p.matches(new URL("https://example.test/one/child"));
+            assert p.matches(new URL("https://example.test/two/child"));
+            assert !p.matches(new URL("https://example.test/twoevil"));
+            manager.save(p, null); manager.test(p.name);
+            await(() -> p.lastSuccess != null);
+            assert f.sentRequests.peek().startsWith("POST /login");
+            java.time.Instant first = p.lastSuccess;
+            await(() -> { manager.test(p.name); return !p.lastSuccess.equals(first); });
+            assert f.sentRequests.stream().anyMatch(r -> r.startsWith("POST /refresh") && r.endsWith("refresh=rotated"));
+            ProfileStore.save(file, Arrays.asList(p));
+            SessionProfile restored = ProfileStore.load(file).get(0);
+            assert restored.loginRequest.equals(p.loginRequest) && restored.loginEndpoint.equals(p.loginEndpoint);
+            assert restored.scopeRules.equals(p.scopeRules);
+        } finally { manager.extensionUnloaded(); java.nio.file.Files.deleteIfExists(file); }
     }
     private static void extraction() throws Exception {
         SessionProfile alice = profile("alice", true, true), bob = profile("bob", true, true);
@@ -246,6 +272,10 @@ public final class SessionProfilesTest {
     }
     private static void protocols() throws Exception {
         Fixture f = new Fixture();
+        com.nccgroup.jwtreauth.ui.ProfileRequestEditor editor = new com.nccgroup.jwtreauth.ui.ProfileRequestEditor(
+                f.callbacks, () -> "https://example.test/login", bytes("POST /login HTTP/1.1\r\nHost: example.test\r\n\r\n"));
+        assert editor.getHttpService() != null && editor.getRequest().length > 0 && editor.getResponse() != null;
+        assert f.editors.get(0).controller == editor;
         ReauthHttpClient client = new ReauthHttpClient(f.callbacks);
         byte[] request = bytes("POST /refresh?q=1 HTTP/2\r\nHost: virtual.test:8443\r\nConnection: keep-alive, X-Hop\r\nX-Hop: discard\r\nCookie: session=seed; csrf=first==; duplicate=one\r\ncookie: duplicate=two; empty=; quoted=\"a=b\"\r\nContent-Length: 999\r\n\r\ntoken=seed");
         ReauthHttpClient.Prepared h2 = client.prepare(f.service, request, ReauthHttpClient.Protocol.AUTO);

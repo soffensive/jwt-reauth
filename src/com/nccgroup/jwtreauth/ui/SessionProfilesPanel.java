@@ -43,6 +43,7 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
         }
     };
     private final Timer timer;
+    private JDialog profileDialog;
     private final JButton saveFile = new JButton("Save profiles...");
     private final JButton loadFile = new JButton("Load profiles...");
     private final JLabel fileStatus = new JLabel("Profile files include requests and token values in plain text.");
@@ -72,7 +73,7 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
         SessionProfile selected = selected(); rows = profiles.list(); model.setRowCount(0);
         for (SessionProfile p : rows) {
             model.addRow(new Object[]{p.name, p.enabled, p.autoMatch ? "Scope" : "Marker",
-                    p.autoMatch ? "URLs under " + p.scope : SessionProfiles.MARKER + ": " + p.name + " (only under " + p.scope + ")",
+                    p.autoMatch ? (p.scopeRules.isBlank() ? "URLs under " + p.scope : p.scopeRules) : SessionProfiles.MARKER + ": " + p.name + " (within " + (p.scopeRules.isBlank() ? p.scope.toString() : p.scopeRules) + ")",
                     p.enabled ? p.status : "Inactive — " + p.status,
                     p.lastSuccess == null ? "Never" : p.lastSuccess.toString(), p.nextRenewal == null ? "—" : p.nextRenewal.toString()});
             if (selected != null && selected.name.equals(p.name)) table.setRowSelectionInterval(model.getRowCount() - 1, model.getRowCount() - 1);
@@ -129,13 +130,29 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
         }.execute();
     }
     public void importRequest(IHttpRequestResponse message) { edit(null, message); }
-    private void edit(SessionProfile existing, IHttpRequestResponse imported) {
+    public void importLoginRequest(IHttpRequestResponse message) { importWorkflowRequest(message, true); }
+    public void importRefreshRequest(IHttpRequestResponse message) { importWorkflowRequest(message, false); }
+    private void importWorkflowRequest(IHttpRequestResponse message, boolean login) {
+        if (profileDialog != null && profileDialog.isDisplayable()) { profileDialog.toFront(); return; }
+        List<SessionProfile> current = profiles.list();
+        List<String> options = new ArrayList<>(); options.add("Create new profile");
+        current.forEach(p -> options.add(p.name));
+        Object chosen = JOptionPane.showInputDialog(this, "Set " + (login ? "login" : "refresh") + " request for:", "JWT re-auth request",
+                JOptionPane.PLAIN_MESSAGE, null, options.toArray(), options.get(0));
+        if (chosen == null) return;
+        SessionProfile selected = current.stream().filter(p -> p.name.equals(chosen)).findFirst().orElse(null);
+        edit(selected, message, login);
+    }
+    private void edit(SessionProfile existing, IHttpRequestResponse imported) { edit(existing, imported, false); }
+    private void edit(SessionProfile existing, IHttpRequestResponse imported, boolean loginImport) {
+        if (profileDialog != null && profileDialog.isDisplayable()) { profileDialog.toFront(); return; }
         JDialog dialog = new JDialog(SwingUtilities.getWindowAncestor(this), "Session profile", Dialog.ModalityType.APPLICATION_MODAL);
+        profileDialog = dialog;
         JPanel content = new JPanel(new BorderLayout(8, 8)); content.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
         JPanel fields = new JPanel(new GridLayout(0, 2, 6, 6));
         JTextField name = new JTextField(existing == null ? "" : existing.name);
         String importedUrl = imported == null ? "https://example.test/refresh" : extension.getCallbacks().getHelpers().analyzeRequest(imported).getUrl().toString();
-        JTextField endpoint = new JTextField(existing == null ? importedUrl : existing.endpoint.toString());
+        JTextField endpoint = new JTextField(existing == null || imported != null && !loginImport ? importedUrl : existing.endpoint.toString());
         String defaultScope = imported == null ? "https://example.test/" : origin(extension.getCallbacks().getHelpers().analyzeRequest(imported).getUrl());
         JTextField scope = new JTextField(existing == null ? defaultScope : existing.scope.toString());
         JSpinner interval = new JSpinner(new SpinnerNumberModel(existing == null ? 300 : existing.interval, 5, 86400, 5));
@@ -166,9 +183,26 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
         fields.add(new JLabel("Renew every (seconds)")); fields.add(interval);
         fields.add(new JLabel("HTTP protocol")); fields.add(protocol);
         content.add(fields, BorderLayout.NORTH);
-        IMessageEditor requestEditor = extension.getCallbacks().createMessageEditor(null, true);
+
         String raw = existing == null ? "GET /refresh HTTP/1.1\r\nHost: example.test\r\n\r\n" : existing.request;
-        requestEditor.setMessage(imported == null ? extension.getCallbacks().getHelpers().stringToBytes(raw) : imported.getRequest(), true);
+        IMessageEditor requestEditor = new ProfileRequestEditor(extension.getCallbacks(), endpoint::getText,
+                imported == null || loginImport ? extension.getCallbacks().getHelpers().stringToBytes(raw) : imported.getRequest()).editor;
+        JTextField loginUrl = new JTextField(existing == null || existing.loginEndpoint == null ? "" : existing.loginEndpoint.toString());
+        if (loginImport) loginUrl.setText(extension.getCallbacks().getHelpers().analyzeRequest(imported).getUrl().toString());
+        JCheckBox useLogin = new JCheckBox("Use login before refresh", loginImport || existing != null && !existing.loginRequest.isBlank());
+        String loginRaw = existing != null && !existing.loginRequest.isBlank() ? existing.loginRequest : "POST /login HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        IMessageEditor loginEditor = new ProfileRequestEditor(extension.getCallbacks(), loginUrl::getText,
+                loginImport ? imported.getRequest() : extension.getCallbacks().getHelpers().stringToBytes(loginRaw)).editor;
+        JPanel loginSettings = new JPanel(new GridLayout(0, 1)); loginSettings.add(useLogin); loginSettings.add(new JLabel("Login destination URL:")); loginSettings.add(loginUrl);
+        JPanel loginPanel = new JPanel(new BorderLayout()); loginPanel.add(loginSettings, BorderLayout.NORTH); loginPanel.add(loginEditor.getComponent(), BorderLayout.CENTER);
+        loginUrl.setToolTipText("Login destination URL; uncheck Use login before refresh for refresh-only operation");
+        JTextArea scopeRules = new JTextArea(existing == null ? "" : existing.scopeRules, 5, 60);
+        JPanel scopesPanel = new JPanel(new BorderLayout());
+        scopesPanel.add(new JLabel("One EXACT url or SUBTREE url per line. Blank uses the scope URL above."), BorderLayout.NORTH);
+        scopesPanel.add(new JScrollPane(scopeRules), BorderLayout.CENTER);
+        JTabbedPane workflow = new JTabbedPane(); workflow.addTab("Refresh request", requestEditor.getComponent());
+        workflow.addTab("Login request (optional)", loginPanel); workflow.addTab("Scope rules", scopesPanel);
+        if (loginImport) workflow.setSelectedComponent(loginPanel);
         DefaultTableModel rules = new DefaultTableModel(new String[]{"Variable", "Extract from", "Cookie / header / JSON path / regex", "Initial value", "Use in requests", "Destination name", "Value prefix"}, 0);
         if (existing != null) for (SessionProfile.Rule r : existing.rules) rules.addRow(new Object[]{r.variable, r.source, r.selector, r.initial, r.destination, r.target, r.prefix});
         JTable ruleTable = new JTable(rules);
@@ -192,7 +226,7 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
         JButton addVariable = new JButton("Add renewal variable"); addVariable.addActionListener(e -> rules.addRow(new Object[]{"refresh", SessionProfile.Source.JSON, "refresh_token", "", SessionProfile.Destination.VARIABLE, "", ""})); ruleButtons.add(addVariable);
         JButton delete = new JButton("Remove row"); delete.addActionListener(e -> { if (ruleTable.getSelectedRow() >= 0) rules.removeRow(ruleTable.getSelectedRow()); }); ruleButtons.add(delete);
         extraction.add(ruleButtons, BorderLayout.SOUTH);
-        JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, requestEditor.getComponent(), extraction); split.setResizeWeight(.55); content.add(split, BorderLayout.CENTER);
+        JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, workflow, extraction); split.setResizeWeight(.55); content.add(split, BorderLayout.CENTER);
         JPanel bottom = new JPanel(new BorderLayout());
         bottom.add(new JLabel("Initial values bootstrap renewal. Values are inserted literally. Use Save profiles to persist settings and values. See Tokens for current values and Debugging for renewal exchanges."), BorderLayout.NORTH);
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT));
@@ -207,6 +241,8 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
                             SessionProfile.Destination.valueOf(cell(rules, row, 4)), cell(rules, row, 5), cell(rules, row, 6)));
                     SessionProfile profile = new SessionProfile(name.getText().trim(), new URL(endpoint.getText().trim()), new URL(scope.getText().trim()),
                             extension.getCallbacks().getHelpers().bytesToString(requestEditor.getMessage()), ((Number) interval.getValue()).intValue(), definitions, existing != null && existing.enabled, "Scope".equals(matchBy.getSelectedItem()), (ReauthHttpClient.Protocol) protocol.getSelectedItem());
+                    String login = useLogin.isSelected() ? extension.getCallbacks().getHelpers().bytesToString(loginEditor.getMessage()) : "";
+                    profile.configureWorkflow(login, loginUrl.getText().isBlank() ? null : new URL(loginUrl.getText().trim()), scopeRules.getText());
                     profiles.save(profile, existing == null ? null : existing.name);
                     if (action.equals("Save and test") && !profile.enabled) profiles.test(profile.name);
                     refresh(); dialog.dispose();
@@ -214,7 +250,8 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
             }); buttons.add(save);
         }
         bottom.add(buttons, BorderLayout.SOUTH); content.add(bottom, BorderLayout.SOUTH);
-        dialog.setContentPane(content); dialog.setSize(1150, 780); dialog.setLocationRelativeTo(this); dialog.setVisible(true);
+        dialog.setContentPane(content); dialog.setSize(1150, 780); dialog.setLocationRelativeTo(this);
+        try { dialog.setVisible(true); } finally { profileDialog = null; }
     }
     private static String cell(DefaultTableModel model, int row, int col) { Object value = model.getValueAt(row, col); return value == null ? "" : value.toString(); }
     private static String origin(URL url) { return url.getProtocol() + "://" + url.getAuthority() + "/"; }

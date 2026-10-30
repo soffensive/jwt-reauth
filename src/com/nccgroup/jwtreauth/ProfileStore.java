@@ -29,6 +29,7 @@ public final class ProfileStore {
     }
     private static final class ProfileData {
         String name, endpoint, scope, request;
+        String loginRequest = "", loginEndpoint, scopeRules = "";
         int interval;
         boolean enabled, autoMatch;
         ReauthHttpClient.Protocol protocol = ReauthHttpClient.Protocol.AUTO;
@@ -46,6 +47,7 @@ public final class ProfileStore {
         for (SessionProfile profile : profiles) {
             ProfileData data = new ProfileData();
             data.name = profile.name; data.endpoint = profile.endpoint.toString(); data.scope = profile.scope.toString();
+            data.loginRequest = profile.loginRequest; data.loginEndpoint = profile.loginEndpoint == null ? null : profile.loginEndpoint.toString(); data.scopeRules = profile.scopeRules;
             data.request = profile.request; data.interval = profile.interval; data.enabled = profile.enabled;
             data.autoMatch = profile.autoMatch; data.protocol = profile.protocol; data.currentValues = profile.snapshot();
             data.rules = new ArrayList<>();
@@ -82,6 +84,7 @@ public final class ProfileStore {
                 }
                 SessionProfile profile = new SessionProfile(Objects.requireNonNull(data.name), new URL(data.endpoint), new URL(data.scope),
                         Objects.requireNonNull(data.request), data.interval, rules, data.enabled, data.autoMatch, Objects.requireNonNull(data.protocol));
+                profile.configureWorkflow(data.loginRequest, data.loginEndpoint == null ? null : new URL(data.loginEndpoint), data.scopeRules);
                 if (data.currentValues != null) profile.restoreValues(data.currentValues);
                 result.add(profile);
             }

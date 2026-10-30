@@ -106,3 +106,27 @@ independently maintained and not endorsed by NCC Group.
 
 See [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for
 attribution and bundled dependency licenses, also included in the release JAR.
+
+## Login and refresh workflows
+
+The profile editor has **Refresh request**, **Login request (optional)**, and
+**Scope rules** tabs. Right-click a captured login request and choose **Send to JWT re-auth (set login
+request)**, then select an existing profile or create a new one. The editor opens
+on the login tab with its URL and request populated. Alternatively, check
+**Use login before refresh** and enter the URL and request manually. Click
+**Save and test** to test the workflow. To bootstrap a session:
+login runs until it succeeds, then subsequent renewals use the refresh request.
+Both steps use the profile's extraction rules and protocol selection. Leave the
+login request blank for refresh-only operation. Imported profiles run login again
+when configured. There is no automatic fallback to login after refresh failure.
+
+Scope rules accept one `EXACT https://example.test/path` or
+`SUBTREE https://example.test/path` per line. Rules are combined with OR; exact
+rules include the query string, while subtree rules match path boundaries.
+Blank rules retain the single scope URL behavior. Marker mode also respects
+these allowed URL rules. Login settings and scope rules are included in files.
+
+To update a refresh request, right-click it in Burp and choose **Send to JWT
+re-auth (set refresh request)**. Select an existing profile or create a new one;
+the Refresh tab opens with the request and destination URL populated. Existing
+login settings and extraction rules are retained until you save your edits.

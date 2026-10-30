@@ -102,12 +102,15 @@ public final class SessionProfiles implements IExtensionStateListener {
         SessionProfile profile = entry.profile;
         profile.status = "Renewing";
         String flightKey = null, targetKey = null;
-        String requestText = "", responseText = "";
+        String requestText = "", responseText = "", exchangeUrl = profile.endpoint.toString();
         Map<String, String> previousValues = profile.snapshot();
         try {
             renewing.set(true);
-            byte[] raw = helpers.stringToBytes(profile.render());
-            IHttpService service = helpers.buildHttpService(profile.endpoint.getHost(), SessionProfile.port(profile.endpoint), profile.endpoint.getProtocol());
+            boolean login = profile.lastSuccess == null && !profile.loginRequest.isBlank();
+            URL destination = login ? profile.loginEndpoint : profile.endpoint;
+            exchangeUrl = destination.toString();
+            byte[] raw = helpers.stringToBytes(login ? profile.render(profile.loginRequest) : profile.render());
+            IHttpService service = helpers.buildHttpService(destination.getHost(), SessionProfile.port(destination), destination.getProtocol());
             ReauthHttpClient client = new ReauthHttpClient(extension.getCallbacks());
             ReauthHttpClient.Prepared prepared = client.prepare(service, raw, profile.protocol);
             requestText = helpers.bytesToString(prepared.request);
@@ -121,7 +124,7 @@ public final class SessionProfiles implements IExtensionStateListener {
             int status = helpers.analyzeResponse(response).getStatusCode();
             if (status < 200 || status >= 300) throw new IllegalArgumentException("HTTP " + status);
             if (!active(entry)) {
-                debugLog.addRenewal(profile.name, profile.endpoint.toString(), "Discarded result: profile deleted or replaced", requestText, responseText, "Profile no longer active.");
+                debugLog.addRenewal(profile.name, exchangeUrl, "Discarded result: profile deleted or replaced", requestText, responseText, "Profile no longer active.");
                 return;
             }
             Map<String, String> before = profile.snapshot();
@@ -130,14 +133,14 @@ public final class SessionProfiles implements IExtensionStateListener {
             profile.snapshot().forEach((name, value) -> results.add(name + (Objects.equals(before.get(name), value) ? " unchanged" : " updated")));
             profile.lastSuccess = Instant.now();
             profile.status = "Ready — " + String.join(", ", results);
-            debugLog.addRenewal(profile.name, profile.endpoint.toString(), profile.status, requestText, responseText,
-                    "Protocol: " + prepared.description() + "\nPrevious variables: " + previousValues + "\nCurrent variables: " + profile.snapshot());
+            debugLog.addRenewal(profile.name, exchangeUrl, profile.status, requestText, responseText,
+                    "Workflow step: " + (login ? "Login" : "Refresh") + "\nProtocol: " + prepared.description() + "\nPrevious variables: " + previousValues + "\nCurrent variables: " + profile.snapshot());
         } catch (RuntimeException ex) {
             // Do not include exception messages from parsers or HTTP helpers: they may contain secrets.
             profile.status = "Failed — " + (ex instanceof com.google.gson.JsonParseException ? "malformed JSON; previous values retained" : ex instanceof IllegalArgumentException && ex.getMessage() != null &&
                     (ex.getMessage().startsWith("Missing response value:") || ex.getMessage().startsWith("Invalid value for destination:") || ex.getMessage().startsWith("HTTP ") || ex.getMessage().equals("No HTTP response"))
                     ? ex.getMessage() : "invalid response or request; previous values retained");
-            debugLog.addRenewal(profile.name, profile.endpoint.toString(), profile.status, requestText, responseText,
+            debugLog.addRenewal(profile.name, exchangeUrl, profile.status, requestText, responseText,
                     "Retained variables: " + profile.snapshot() + "\n" + ex.toString() + "\nProtocol: " + profile.protocol);
         } finally {
             if (flightKey != null) inFlight.computeIfPresent(flightKey, (key, count) -> count == 1 ? null : count - 1);

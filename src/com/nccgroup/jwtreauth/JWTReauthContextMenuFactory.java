@@ -37,7 +37,19 @@ public class JWTReauthContextMenuFactory implements IContextMenuFactory {
                     var messages = invocation.getSelectedMessages();
                     if (messages != null && messages.length == 1) extension.getSessionProfilesPanel().importRequest(messages[0]);
                 });
-                return Collections.singletonList(item);
+                JMenuItem login = new JMenuItem("Send to JWT re-auth (set login request)");
+                login.addActionListener(event -> {
+                    var messages = invocation.getSelectedMessages();
+                    if (messages != null && messages.length == 1) extension.getSessionProfilesPanel().importLoginRequest(messages[0]);
+                    else javax.swing.JOptionPane.showMessageDialog(null, "Select one request to set as the login request.");
+                });
+                JMenuItem refresh = new JMenuItem("Send to JWT re-auth (set refresh request)");
+                refresh.addActionListener(event -> {
+                    var messages = invocation.getSelectedMessages();
+                    if (messages != null && messages.length == 1) extension.getSessionProfilesPanel().importRefreshRequest(messages[0]);
+                    else javax.swing.JOptionPane.showMessageDialog(null, "Select one request to set as the refresh request.");
+                });
+                return java.util.Arrays.asList(item, login, refresh);
             default: return null;
         }
     }

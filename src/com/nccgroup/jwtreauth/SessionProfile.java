@@ -115,9 +115,39 @@ public final class SessionProfile {
         Matcher m = PLACEHOLDER.matcher(this.request);
         while (m.find()) if (!initial.containsKey(m.group(1))) throw new IllegalArgumentException("Unknown variable: " + m.group(1));
     }
+    public String loginRequest = "";
+    public URL loginEndpoint;
+    public String scopeRules = "";
+    public void configureWorkflow(String login, URL loginUrl, String scopes) {
+        login = login.replace("\r\n", "\n").replace("\n", "\r\n");
+        if (!login.isBlank()) {
+            ReauthHttpClient.validate(login);
+            if (loginUrl == null || !(loginUrl.getProtocol().equals("https") || loginUrl.getProtocol().equals("http")))
+                throw new IllegalArgumentException("Login requires an HTTP(S) URL.");
+        }
+        for (String rule : scopes.split("\r?\n")) if (!rule.isBlank()) {
+            if (!(rule.startsWith("EXACT ") || rule.startsWith("SUBTREE "))) throw new IllegalArgumentException("Use EXACT url or SUBTREE url on each scope line.");
+            try {
+                URL url = new URL(rule.substring(rule.indexOf(' ') + 1).trim());
+                if (!url.getProtocol().matches("https?")) throw new IllegalArgumentException("Scope must be HTTP(S).");
+            } catch (java.net.MalformedURLException ex) { throw new IllegalArgumentException("Invalid scope URL."); }
+        }
+        loginRequest = login; loginEndpoint = loginUrl; scopeRules = scopes;
+    }
     public boolean matches(URL url) {
+        if (scopeRules.isBlank()) return matchScope(scope, url, false);
+        for (String rule : scopeRules.split("\r?\n")) if (!rule.isBlank()) {
+            try {
+                if (matchScope(new URL(rule.substring(rule.indexOf(' ') + 1).trim()), url, rule.startsWith("EXACT "))) return true;
+            } catch (java.net.MalformedURLException impossible) { throw new IllegalStateException(impossible); }
+        }
+        return false;
+    }
+    private static boolean matchScope(URL scope, URL url, boolean exact) {
         String path = scope.getPath().isEmpty() ? "/" : scope.getPath();
-        return sameOrigin(scope, url) && (url.getPath().equals(path) || url.getPath().startsWith(path.endsWith("/") ? path : path + "/"));
+        if (!sameOrigin(scope, url)) return false;
+        if (exact) return path.equals(url.getPath().isEmpty() ? "/" : url.getPath()) && Objects.equals(scope.getQuery(), url.getQuery());
+        return url.getPath().equals(path) || url.getPath().startsWith(path.endsWith("/") ? path : path + "/");
     }
     public static boolean sameOrigin(URL a, URL b) {
         return a.getProtocol().equalsIgnoreCase(b.getProtocol()) && a.getHost().equalsIgnoreCase(b.getHost())
@@ -146,9 +176,10 @@ public final class SessionProfile {
         }
         values = Collections.unmodifiableMap(inherited);
     }
-    public String render() {
+    public String render() { return render(request); }
+    public String render(String template) {
         Map<String, String> snapshot = values;
-        Matcher m = PLACEHOLDER.matcher(request);
+        Matcher m = PLACEHOLDER.matcher(template);
         StringBuffer out = new StringBuffer();
         while (m.find()) m.appendReplacement(out, Matcher.quoteReplacement(snapshot.get(m.group(1))));
         m.appendTail(out); return out.toString();
