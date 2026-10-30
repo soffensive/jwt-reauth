@@ -27,7 +27,7 @@ public final class SessionProfilesTest {
     private static final String RESPONSE = "HTTP/1.1 200 OK\r\nSet-Cookie: session=new-cookie; Path=/\r\nX-CSRF: csrf-value\r\n\r\n{\"data\":{\"access_token\":\"new-token\"},\"refresh_token\":\"rotated\"}";
     private static final String NO_MATCH = "HTTP/1.1 200 OK\r\n\r\n{\"error\":\"expired\"}";
     public static void main(String[] args) throws Exception {
-        workflow(); extraction(); routing(); concurrency(); protocols(); persistence(); debugHistory(); startup();
+        workflow(); scope(); extraction(); routing(); concurrency(); protocols(); persistence(); debugHistory(); startup();
         System.out.println("Session profile extraction, routing, and concurrency tests passed");
     }
     private static void startup() throws Exception {
@@ -88,9 +88,9 @@ public final class SessionProfilesTest {
                 return visible.get();
             });
             String longToken = "eyJ" + "a".repeat(3000);
-            SessionProfile longProfile = new SessionProfile("long", tokenProfile.endpoint, tokenProfile.scope, tokenProfile.request, 3600,
+            SessionProfile longProfile = new SessionProfile("long", tokenProfile.endpoint, tokenProfile.scope, false, tokenProfile.request, 3600,
                     Arrays.asList(new SessionProfile.Rule("token", SessionProfile.Source.JSON, "access_token", longToken, SessionProfile.Destination.HEADER, "Authorization", "Bearer "),
-                            new SessionProfile.Rule("refresh", SessionProfile.Source.JSON, "refresh_token", "r", SessionProfile.Destination.VARIABLE, "")), false, false);
+                            new SessionProfile.Rule("refresh", SessionProfile.Source.JSON, "refresh_token", "r", SessionProfile.Destination.VARIABLE, "")), false, false, ReauthHttpClient.Protocol.AUTO);
             extension.getSessionProfiles().save(longProfile, null);
             await(() -> {
                 java.util.concurrent.atomic.AtomicBoolean wrapped = new java.util.concurrent.atomic.AtomicBoolean();
@@ -187,13 +187,10 @@ public final class SessionProfilesTest {
         Fixture f = new Fixture(); SessionProfiles manager = new SessionProfiles(f.extension);
         java.nio.file.Path file = java.nio.file.Files.createTempFile("workflow", ".json");
         try {
-            SessionProfile p = profile("workflow", false, false);
-            p.configureWorkflow("POST /login HTTP/1.1\r\nHost: example.test\r\n\r\nuser=alice", new URL("https://example.test/login"),
-                    "EXACT https://example.test/one\nSUBTREE https://example.test/two");
-            assert p.matches(new URL("https://example.test/one"));
-            assert !p.matches(new URL("https://example.test/one/child"));
-            assert p.matches(new URL("https://example.test/two/child"));
-            assert !p.matches(new URL("https://example.test/twoevil"));
+            // The whole origin is in scope, so the login bypass below is tested on an in-scope URL.
+            SessionProfile p = withScope("workflow", Collections.singletonList(ScopeRule.include(new URL("https://example.test/"))), false, false, false);
+            p.configureWorkflow("POST /login HTTP/1.1\r\nHost: example.test\r\n\r\nuser=alice", new URL("https://example.test/login"));
+            assert p.matches(new URL("https://example.test/login"), u -> false);
             manager.save(p, null); manager.test(p.name);
             await(() -> p.lastSuccess != null);
             assert f.sentRequests.peek().startsWith("POST /login");
@@ -222,13 +219,78 @@ public final class SessionProfilesTest {
             assert latest(manager).kind.equals("Routing");
             try {
                 profile("placeholder", false, false).configureWorkflow("POST /login HTTP/1.1\r\nHost: example.test\r\n\r\nuser=${missing}",
-                        new URL("https://example.test/login"), "");
+                        new URL("https://example.test/login"));
                 throw new AssertionError("Unknown login placeholder accepted");
             } catch (IllegalArgumentException expected) { assert expected.getMessage().contains("missing"); }
             ProfileStore.save(file, Arrays.asList(p));
             SessionProfile restored = ProfileStore.load(file).get(0);
             assert restored.loginRequest.equals(p.loginRequest) && restored.loginEndpoint.equals(p.loginEndpoint);
-            assert restored.scopeRules.equals(p.scopeRules);
+            assert restored.scope.equals(p.scope);
+        } finally { manager.extensionUnloaded(); java.nio.file.Files.deleteIfExists(file); }
+    }
+    private static SessionProfile withScope(String name, List<ScopeRule> scope, boolean burpScope, boolean enabled, boolean automatic) throws Exception {
+        SessionProfile p = profile(name, false, false);
+        return new SessionProfile(name, p.endpoint, scope, burpScope, p.request, p.interval, p.rules, enabled, automatic, ReauthHttpClient.Protocol.AUTO);
+    }
+    private static URL url(String path) throws Exception { return new URL("https://example.test" + path); }
+    private static void scope() throws Exception {
+        java.util.function.Predicate<URL> outside = u -> false, inside = u -> true;
+        List<ScopeRule> rules = Arrays.asList(
+                new ScopeRule(ScopeRule.Action.INCLUDE, ScopeRule.Match.EXACT, url("/one")),
+                new ScopeRule(ScopeRule.Action.INCLUDE, ScopeRule.Match.PREFIX, url("/api")),
+                new ScopeRule(ScopeRule.Action.EXCLUDE, ScopeRule.Match.PREFIX, url("/api/logout")));
+        SessionProfile p = withScope("scoped", rules, false, false, true);
+        assert p.matches(url("/one"), outside) && p.matches(url("/one?page=2"), outside) : "EXACT compares the path, not the query";
+        assert !p.matches(url("/one/child"), outside);
+        assert p.matches(url("/api"), outside) && p.matches(url("/api/users"), outside) && !p.matches(url("/apievil"), outside);
+        assert !p.matches(url("/api/logout"), outside) && !p.matches(url("/api/logout/all"), outside) : "Exclusions win over inclusions";
+        assert p.matches(url("/api/logoutx"), outside) : "Exclusions also match on path boundaries";
+        assert !p.matches(new URL("https://other.test/api"), outside) && !p.matches(new URL("http://example.test/api"), outside);
+        assert !p.matches(url("/api/../admin"), inside) && !p.matches(url("/api/%2E%2e/admin"), inside);
+        assert p.describeScope().equals("exactly https://example.test/one (+1), 1 exclusion");
+        try { withScope("excludes-only", rules.subList(2, 3), false, false, true); throw new AssertionError("Profile without an include accepted"); }
+        catch (IllegalArgumentException expected) { assert expected.getMessage().contains("Burp target scope"); }
+        try { new ScopeRule(ScopeRule.Action.INCLUDE, ScopeRule.Match.PREFIX, new URL("ftp://example.test/")); throw new AssertionError("FTP scope accepted"); }
+        catch (IllegalArgumentException expected) { }
+        SessionProfile burp = withScope("burp", rules.subList(2, 3), true, false, true);
+        assert burp.matches(url("/anything"), inside) && !burp.matches(url("/anything"), outside);
+        assert !burp.matches(url("/api/logout"), inside) : "Exclusions also apply to Burp's target scope";
+        assert burp.describeScope().equals("Burp target scope, 1 exclusion");
+
+        Fixture f = new Fixture(); f.burpScope.add("https://example.test/in"); SessionProfiles manager = new SessionProfiles(f.extension);
+        java.nio.file.Path file = java.nio.file.Files.createTempFile("scope", ".json");
+        try {
+            SessionProfile routed = withScope("routed", Collections.emptyList(), true, true, true);
+            manager.save(routed, null);
+            await(() -> routed.lastSuccess != null);
+            IHttpRequestResponse in = f.message("GET /in/page HTTP/1.1\r\nHost: example.test\r\n\r\n");
+            assert manager.process(true, in) && string(in.getRequest()).contains("Authorization: Bearer new-token") : "Burp target scope routes requests";
+            IHttpRequestResponse out = f.message("GET /out HTTP/1.1\r\nHost: example.test\r\n\r\n");
+            assert !manager.process(true, out) && !string(out.getRequest()).contains("Authorization:");
+
+            ProfileStore.save(file, Arrays.asList(p, burp));
+            List<SessionProfile> restored = ProfileStore.load(file);
+            assert restored.get(0).scope.equals(rules) && !restored.get(0).burpScope;
+            assert restored.get(1).scope.equals(rules.subList(2, 3)) && restored.get(1).burpScope;
+            assert java.nio.file.Files.readString(file).contains("\"schemaVersion\": 2");
+
+            // Version 1 files: a plain scope URL, or EXACT/SUBTREE lines that replace it.
+            com.google.gson.JsonObject v1 = com.google.gson.JsonParser.parseString(java.nio.file.Files.readString(file)).getAsJsonObject();
+            v1.addProperty("schemaVersion", 1);
+            com.google.gson.JsonArray old = v1.getAsJsonArray("profiles");
+            old.get(0).getAsJsonObject().addProperty("scope", "https://example.test/api");
+            old.get(1).getAsJsonObject().addProperty("scope", "https://example.test/ignored");
+            old.get(1).getAsJsonObject().addProperty("scopeRules", "EXACT https://example.test/one\nSUBTREE https://example.test/two\n");
+            old.forEach(profile -> profile.getAsJsonObject().remove("burpScope"));
+            java.nio.file.Files.writeString(file, v1.toString());
+            List<SessionProfile> migrated = ProfileStore.load(file);
+            assert migrated.get(0).scope.equals(Collections.singletonList(ScopeRule.include(url("/api")))) && !migrated.get(0).burpScope;
+            assert migrated.get(1).scope.equals(Arrays.asList(new ScopeRule(ScopeRule.Action.INCLUDE, ScopeRule.Match.EXACT, url("/one")),
+                    new ScopeRule(ScopeRule.Action.INCLUDE, ScopeRule.Match.PREFIX, url("/two")))) && !migrated.get(1).burpScope;
+            old.get(0).getAsJsonObject().addProperty("scopeRules", "INCLUDE https://example.test/");
+            java.nio.file.Files.writeString(file, v1.toString());
+            try { ProfileStore.load(file); throw new AssertionError("Invalid version 1 rule accepted"); }
+            catch (java.io.IOException expected) { }
         } finally { manager.extensionUnloaded(); java.nio.file.Files.deleteIfExists(file); }
     }
     private static void extraction() throws Exception {
@@ -244,13 +306,8 @@ public final class SessionProfilesTest {
         catch (IllegalArgumentException expected) { assert alice.snapshot() == before; }
         try { alice.accept(RESPONSE.replace("rotated", "a\\r\\nX-Injected: 1")); throw new AssertionError("CR/LF variable accepted"); }
         catch (IllegalArgumentException expected) { assert alice.snapshot() == before : "Unsafe values must not be rendered into renewals"; }
-        assert !alice.matches(new URL("https://example.test/api/../admin"));
-        assert !alice.matches(new URL("https://example.test/api/%2E%2e/admin"));
         assert new SessionProfile.Rule("csrf", SessionProfile.Source.HEADER, "x-csrf", "", SessionProfile.Destination.VARIABLE, "").extract(RESPONSE).equals("csrf-value");
         assert new SessionProfile.Rule("refresh", SessionProfile.Source.REGEX, "\"refresh_token\":\"([^\"]+)\"", "", SessionProfile.Destination.VARIABLE, "").extract(RESPONSE).equals("rotated");
-        assert alice.matches(new URL("https://example.test/api/users"));
-        assert !alice.matches(new URL("https://example.test/apievil"));
-        assert !alice.matches(new URL("https://other.test/api"));
     }
     private static void routing() throws Exception {
         Fixture f = new Fixture(); SessionProfiles profiles = new SessionProfiles(f.extension);
@@ -384,12 +441,12 @@ public final class SessionProfilesTest {
         assert string(forced.body).equals("test");
         for (String version : Arrays.asList("HTTP/1.0", "HTTP/1.1", "HTTP/2", "HTTP/2.0")) {
             SessionProfile p = profile("version", false, false);
-            new SessionProfile(p.name, p.endpoint, p.scope, p.request.replace("HTTP/1.1", version), p.interval, p.rules, false, false);
+            new SessionProfile(p.name, p.endpoint, p.scope, false, p.request.replace("HTTP/1.1", version), p.interval, p.rules, false, false, ReauthHttpClient.Protocol.AUTO);
         }
         SessionProfiles profiles = new SessionProfiles(f.extension);
         try {
             SessionProfile p = profile("http2", false, false);
-            SessionProfile h2Profile = new SessionProfile(p.name, p.endpoint, p.scope, p.request.replace("HTTP/1.1", "HTTP/2"), p.interval, p.rules, false, false);
+            SessionProfile h2Profile = new SessionProfile(p.name, p.endpoint, p.scope, false, p.request.replace("HTTP/1.1", "HTTP/2"), p.interval, p.rules, false, false, ReauthHttpClient.Protocol.AUTO);
             f.http2Listener = profiles;
             profiles.save(h2Profile, null); profiles.test(h2Profile.name);
             await(() -> h2Profile.lastSuccess != null);
@@ -403,7 +460,7 @@ public final class SessionProfilesTest {
         Fixture fixture = new Fixture(); SessionProfiles manager = new SessionProfiles(fixture.extension);
         try {
             SessionProfile seed = profile("saved", false, true);
-            SessionProfile original = new SessionProfile(seed.name, seed.endpoint, seed.scope,
+            SessionProfile original = new SessionProfile(seed.name, seed.endpoint, seed.scope, false,
                     seed.request.replace("HTTP/1.1", "HTTP/2"), seed.interval, seed.rules, true, true, ReauthHttpClient.Protocol.HTTP_2);
             original.accept(RESPONSE);
             ProfileStore.save(file, Arrays.asList(original, profile("other", false, false)));
@@ -426,7 +483,7 @@ public final class SessionProfilesTest {
             assert manager.list().size() == 3;
             assert manager.list().stream().filter(v -> v.name.equals("saved")).findFirst().get().snapshot().get("refresh").equals("rotated");
             String json = java.nio.file.Files.readString(file);
-            java.nio.file.Files.writeString(file, json.replace("\"schemaVersion\": 1", "\"schemaVersion\": 99"));
+            java.nio.file.Files.writeString(file, json.replace("\"schemaVersion\": 2", "\"schemaVersion\": 99"));
             try { ProfileStore.load(file); throw new AssertionError("Unknown schema accepted"); }
             catch (java.io.IOException expected) { }
             java.nio.file.Files.writeString(file, json.replace("\"interval\": 3600", "\"interval\": 0"));
@@ -463,8 +520,8 @@ public final class SessionProfilesTest {
     }
     private static SessionProfile differentRenewalPath(String name) throws Exception {
         SessionProfile p = profile(name, false, false);
-        return new SessionProfile(p.name, p.endpoint, p.scope, p.request.replace("/refresh", "/rotate"),
-                p.interval, p.rules, false, false);
+        return new SessionProfile(p.name, p.endpoint, p.scope, false, p.request.replace("/refresh", "/rotate"),
+                p.interval, p.rules, false, false, ReauthHttpClient.Protocol.AUTO);
     }
     private interface Check { boolean ok(); }
     private static void await(Check check) throws Exception {
@@ -507,6 +564,7 @@ public final class SessionProfilesTest {
         volatile SessionProfiles http2Listener;
         volatile CountDownLatch started, release;
         volatile String responseText = RESPONSE;
+        final List<String> burpScope = new CopyOnWriteArrayList<>();
         final IHttpService service = proxy(IHttpService.class, (p, m, a) -> {
             switch (m.getName()) { case "getHost": return "example.test"; case "getPort": return 443; case "getProtocol": return "https"; default: return null; }
         });
@@ -538,6 +596,7 @@ public final class SessionProfilesTest {
         });
         final IBurpExtenderCallbacks callbacks = proxy(IBurpExtenderCallbacks.class, (p, m, a) -> {
             if (m.getName().equals("getHelpers")) return helpers;
+            if (m.getName().equals("isInScope")) return burpScope.stream().anyMatch(prefix -> a[0].toString().startsWith(prefix));
             if (m.getName().equals("createMessageEditor")) {
                 EditorDouble editor = new EditorDouble((IMessageEditorController)a[0], (Boolean)a[1]);
                 editors.add(editor); return editor.editor();

@@ -76,7 +76,10 @@ public final class SessionProfile {
         }
     }
     public final String name, request;
-    public final URL endpoint, scope;
+    public final URL endpoint;
+    /** Requests a profile may modify: any INCLUDE match (or Burp's target scope), unless an EXCLUDE matches. */
+    public final List<ScopeRule> scope;
+    public final boolean burpScope;
     public final int interval;
     public final ReauthHttpClient.Protocol protocol;
     public final List<Rule> rules;
@@ -87,22 +90,24 @@ public final class SessionProfile {
     public volatile Instant lastSuccess, nextRenewal;
     private static final Pattern PLACEHOLDER = Pattern.compile("\\$\\{([A-Za-z_][A-Za-z0-9_]*)}");
 
+    /** A profile that modifies requests under one URL prefix. */
     public SessionProfile(String name, URL endpoint, URL scope, String request, int interval,
                           List<Rule> rules, boolean enabled, boolean autoMatch) {
-        this(name, endpoint, scope, request, interval, rules, enabled, autoMatch, ReauthHttpClient.Protocol.AUTO);
+        this(name, endpoint, Collections.singletonList(ScopeRule.include(scope)), false, request, interval, rules, enabled, autoMatch, ReauthHttpClient.Protocol.AUTO);
     }
-    public SessionProfile(String name, URL endpoint, URL scope, String request, int interval,
+    public SessionProfile(String name, URL endpoint, List<ScopeRule> scope, boolean burpScope, String request, int interval,
                           List<Rule> rules, boolean enabled, boolean autoMatch, ReauthHttpClient.Protocol protocol) {
         this.protocol = Objects.requireNonNull(protocol);
         if (!name.matches("[A-Za-z0-9_-]+")) throw new IllegalArgumentException("Profile name must use letters, digits, underscores, or hyphens.");
-        for (URL url : Arrays.asList(endpoint, scope)) {
-            if (!(url.getProtocol().equals("http") || url.getProtocol().equals("https")) || url.getHost().isEmpty())
-                throw new IllegalArgumentException("Use an HTTP or HTTPS URL.");
-        }
+        if (!(endpoint.getProtocol().equals("http") || endpoint.getProtocol().equals("https")) || endpoint.getHost().isEmpty())
+            throw new IllegalArgumentException("Use an HTTP or HTTPS URL.");
+        this.scope = Collections.unmodifiableList(new ArrayList<>(scope)); this.burpScope = burpScope;
+        if (!burpScope && this.scope.stream().noneMatch(r -> r.action == ScopeRule.Action.INCLUDE))
+            throw new IllegalArgumentException("Add an include scope rule or enable Burp target scope.");
         if (interval < 5) throw new IllegalArgumentException("Renewal interval must be at least 5 seconds.");
         this.request = request.replace("\r\n", "\n").replace("\n", "\r\n");
         ReauthHttpClient.validate(this.request);
-        this.name = name; this.endpoint = endpoint; this.scope = scope; this.interval = interval;
+        this.name = name; this.endpoint = endpoint; this.interval = interval;
         this.rules = Collections.unmodifiableList(new ArrayList<>(rules)); this.enabled = enabled; this.autoMatch = autoMatch;
         Map<String, String> initial = new LinkedHashMap<>();
         Set<String> destinations = new HashSet<>();
@@ -118,17 +123,10 @@ public final class SessionProfile {
         Matcher m = PLACEHOLDER.matcher(template);
         while (m.find()) if (!values.containsKey(m.group(1))) throw new IllegalArgumentException("Unknown variable: " + m.group(1));
     }
-    private static final class ScopeRule {
-        final URL url;
-        final boolean exact;
-        ScopeRule(URL url, boolean exact) { this.url = url; this.exact = exact; }
-    }
     // Set by configureWorkflow before SessionProfiles publishes the profile; never changed afterwards.
     public volatile String loginRequest = "";
     public volatile URL loginEndpoint;
-    public volatile String scopeRules = "";
-    private volatile List<ScopeRule> parsedScopes = Collections.emptyList();
-    public void configureWorkflow(String login, URL loginUrl, String scopes) {
+    public void configureWorkflow(String login, URL loginUrl) {
         login = login.replace("\r\n", "\n").replace("\n", "\r\n");
         if (!login.isBlank()) {
             ReauthHttpClient.validate(login);
@@ -136,41 +134,32 @@ public final class SessionProfile {
             if (loginUrl == null || !(loginUrl.getProtocol().equals("https") || loginUrl.getProtocol().equals("http")))
                 throw new IllegalArgumentException("Login requires an HTTP(S) URL.");
         }
-        List<ScopeRule> parsed = new ArrayList<>();
-        for (String rule : scopes.split("\r?\n")) if (!rule.isBlank()) {
-            if (!(rule.startsWith("EXACT ") || rule.startsWith("SUBTREE "))) throw new IllegalArgumentException("Use EXACT url or SUBTREE url on each scope line.");
-            try {
-                URL url = new URL(rule.substring(rule.indexOf(' ') + 1).trim());
-                if (!url.getProtocol().matches("https?") || url.getHost().isEmpty()) throw new IllegalArgumentException("Scope must be an HTTP(S) URL with a host.");
-                parsed.add(new ScopeRule(url, rule.startsWith("EXACT ")));
-            } catch (java.net.MalformedURLException ex) { throw new IllegalArgumentException("Invalid scope URL."); }
+        loginRequest = login; loginEndpoint = loginUrl;
+    }
+    public boolean matches(URL url, java.util.function.Predicate<URL> inBurpScope) {
+        if (ScopeRule.hasDotSegment(url.getPath())) return false;
+        boolean included = false;
+        for (ScopeRule rule : scope) if (rule.matches(url)) {
+            if (rule.action == ScopeRule.Action.EXCLUDE) return false;
+            included = true;
         }
-        loginRequest = login; loginEndpoint = loginUrl; scopeRules = scopes;
-        parsedScopes = Collections.unmodifiableList(parsed);
+        return included || (burpScope && inBurpScope.test(url));
     }
-    public boolean matches(URL url) {
-        List<ScopeRule> rules = parsedScopes;
-        if (rules.isEmpty()) return matchScope(scope, url, false);
-        for (ScopeRule rule : rules) if (matchScope(rule.url, url, rule.exact)) return true;
-        return false;
-    }
-    private static boolean matchScope(URL scope, URL url, boolean exact) {
-        String path = scope.getPath().isEmpty() ? "/" : scope.getPath();
-        if (!sameOrigin(scope, url) || hasDotSegment(url.getPath())) return false;
-        if (exact) return path.equals(url.getPath().isEmpty() ? "/" : url.getPath()) && Objects.equals(scope.getQuery(), url.getQuery());
-        return url.getPath().equals(path) || url.getPath().startsWith(path.endsWith("/") ? path : path + "/");
+    /** Overview summary, e.g. "https://example.test/api (+1), 1 exclusion, Burp scope". */
+    public String describeScope() {
+        List<String> parts = new ArrayList<>();
+        List<ScopeRule> includes = new ArrayList<>();
+        long exclusions = 0;
+        for (ScopeRule rule : scope) if (rule.action == ScopeRule.Action.INCLUDE) includes.add(rule); else exclusions++;
+        if (!includes.isEmpty()) parts.add((includes.get(0).match == ScopeRule.Match.EXACT ? "exactly " : "") + includes.get(0).url
+                + (includes.size() > 1 ? " (+" + (includes.size() - 1) + ")" : ""));
+        if (burpScope) parts.add("Burp target scope");
+        if (exclusions > 0) parts.add(exclusions + (exclusions == 1 ? " exclusion" : " exclusions"));
+        return String.join(", ", parts);
     }
     public static boolean sameOrigin(URL a, URL b) {
         return a.getProtocol().equalsIgnoreCase(b.getProtocol()) && a.getHost().equalsIgnoreCase(b.getHost())
                 && port(a) == port(b);
-    }
-    /** Servers resolve "." and ".." (also percent-encoded), so such paths could escape a prefix match. */
-    private static boolean hasDotSegment(String path) {
-        for (String segment : path.split("/", -1)) {
-            String decoded = segment.replaceAll("(?i)%2e", ".");
-            if (decoded.equals(".") || decoded.equals("..")) return true;
-        }
-        return false;
     }
     public static int port(URL url) { return url.getPort() < 0 ? url.getDefaultPort() : url.getPort(); }
     private static boolean unsafeValue(Rule rule, String value) {

@@ -18,8 +18,8 @@ runs the automated checks.
 1. In **Sessions**, click **New profile**, or right-click a captured request and
    choose **Send to JWT re-auth (create session profile)**.
 2. Set a name, renewal URL, interval, and **Match requests by**: **Scope** or
-   **Marker**. Edit the renewal request in Burp's HTTP editor. The overview shows
-   the matching mode and exact rule for each profile.
+   **Marker**. Edit the renewal request in Burp's HTTP editor and the requests to
+   modify in the **Scope** tab. The overview summarizes each profile's mode and scope.
 3. Add extractors, supply any initial values needed for the first renewal, and
    click **Save and test**.
 4. Check **Active** for the profile directly in the Sessions overview to start
@@ -62,13 +62,25 @@ Profiles renew independently, without overlapping their own requests.
 Each profile uses one mode, shown in the overview's **Match by** and **Applies
 to** columns:
 
-- **Scope:** modifies unmarked requests under the configured scope URL. Matching
-  includes scheme, host, port, and path subtree: `/api` includes `/api/users`,
-  but not `/apievil`. Paths with `.` or `..` segments (including `%2e`) never
-  match. Exactly one active Scope profile must match.
+- **Scope:** modifies unmarked requests within the profile's scope. Exactly one
+  active Scope profile must match.
 - **Marker:** modifies requests containing the profile's marker, for example
-  `X-Reauth-Profile: alice`. Requests must also fall within its **Allowed URLs**.
-  The overview shows both the marker and this URL restriction.
+  `X-Reauth-Profile: alice`. Requests must also fall within the profile's scope.
+  The overview shows both the marker and the scope.
+
+The **Scope** tab holds a table of rules, each with an action, a match type, and
+a URL:
+
+- **INCLUDE** rules add requests; **EXCLUDE** rules remove them and always win,
+  for example include `https://example.test/api` but exclude
+  `https://example.test/api/logout`.
+- **PREFIX** matches the URL's path and everything below it on a segment
+  boundary: `/api` matches `/api/users`, but not `/apievil`. **EXACT** matches
+  the path only. Both ignore query strings.
+- Scheme, host, and port must always match the rule's URL.
+- **Also include Burp target scope** adds every URL in Burp's **Target → Scope**.
+  Exclusions still apply. A profile needs at least one include rule or this option.
+- Paths with `.` or `..` segments (including `%2e`) never match.
 
 The extension strips marker headers before forwarding. Unknown markers,
 conflicting matches, and markers naming a Scope profile inject no credentials.
@@ -114,7 +126,7 @@ attribution and bundled dependency licenses, also included in the release JAR.
 ## Login and refresh workflows
 
 The profile editor has **Refresh request**, **Login request (optional)**, and
-**Scope rules** tabs. Right-click a captured login request and choose **Send to JWT re-auth (set login
+**Scope** tabs. Right-click a captured login request and choose **Send to JWT re-auth (set login
 request)**, then select an existing profile or create a new one. The editor opens
 on the login tab with its URL and request populated. Alternatively, check
 **Use login before refresh** and enter the URL and request manually. Click
@@ -129,11 +141,9 @@ configured. If a refresh fails, the next attempt runs login again, then refresh
 resumes after it succeeds. Requests to the login URL never receive injected
 credentials.
 
-Scope rules accept one `EXACT https://example.test/path` or
-`SUBTREE https://example.test/path` per line. Rules are combined with OR; exact
-rules include the query string, while subtree rules match path boundaries.
-Blank rules retain the single scope URL behavior. Marker mode also respects
-these allowed URL rules. Login settings and scope rules are included in files.
+Login settings and scope rules are included in profile files. Files saved by
+earlier versions still load: their scope URL and `SUBTREE` lines become INCLUDE
+PREFIX rules, and `EXACT` lines become INCLUDE EXACT rules.
 
 To update a refresh request, right-click it in Burp and choose **Send to JWT
 re-auth (set refresh request)**. Select an existing profile or create a new one;

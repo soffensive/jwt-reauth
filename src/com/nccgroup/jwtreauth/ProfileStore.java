@@ -20,21 +20,34 @@ import java.net.URL;
 import java.io.IOException;
 import java.util.*;
 
-/** Versioned JSON persistence. Constructors validate every imported profile before use. */
+/**
+ * Versioned JSON persistence. Constructors validate every imported profile before use.
+ * Version 2 stores scope as rule objects; version 1 files (a scope URL plus optional
+ * "EXACT url" / "SUBTREE url" lines) are converted when loaded.
+ */
 public final class ProfileStore {
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
     private static final class Document {
         Integer schemaVersion;
         List<ProfileData> profiles;
     }
+    private static final int SCHEMA_VERSION = 2;
     private static final class ProfileData {
-        String name, endpoint, scope, request;
-        String loginRequest = "", loginEndpoint, scopeRules = "";
+        String name, endpoint, request;
+        // Version 1: a URL string; version 2: an array of ScopeData.
+        JsonElement scope;
+        String scopeRules; // Version 1 only.
+        String loginRequest = "", loginEndpoint;
         int interval;
-        boolean enabled, autoMatch;
+        boolean enabled, autoMatch, burpScope;
         ReauthHttpClient.Protocol protocol = ReauthHttpClient.Protocol.AUTO;
         List<RuleData> rules;
         Map<String, String> currentValues;
+    }
+    private static final class ScopeData {
+        ScopeRule.Action action;
+        ScopeRule.Match match;
+        String url;
     }
     private static final class RuleData {
         String variable, selector, initial, target, prefix;
@@ -43,11 +56,16 @@ public final class ProfileStore {
     }
     private ProfileStore() { }
     public static void save(Path destination, List<SessionProfile> profiles) throws IOException {
-        Document document = new Document(); document.schemaVersion = 1; document.profiles = new ArrayList<>();
+        Document document = new Document(); document.schemaVersion = SCHEMA_VERSION; document.profiles = new ArrayList<>();
         for (SessionProfile profile : profiles) {
             ProfileData data = new ProfileData();
-            data.name = profile.name; data.endpoint = profile.endpoint.toString(); data.scope = profile.scope.toString();
-            data.loginRequest = profile.loginRequest; data.loginEndpoint = profile.loginEndpoint == null ? null : profile.loginEndpoint.toString(); data.scopeRules = profile.scopeRules;
+            data.name = profile.name; data.endpoint = profile.endpoint.toString(); data.burpScope = profile.burpScope;
+            List<ScopeData> scope = new ArrayList<>();
+            for (ScopeRule rule : profile.scope) {
+                ScopeData d = new ScopeData(); d.action = rule.action; d.match = rule.match; d.url = rule.url.toString(); scope.add(d);
+            }
+            data.scope = GSON.toJsonTree(scope);
+            data.loginRequest = profile.loginRequest; data.loginEndpoint = profile.loginEndpoint == null ? null : profile.loginEndpoint.toString();
             data.request = profile.request; data.interval = profile.interval; data.enabled = profile.enabled;
             data.autoMatch = profile.autoMatch; data.protocol = profile.protocol; data.currentValues = profile.snapshot();
             data.rules = new ArrayList<>();
@@ -70,8 +88,8 @@ public final class ProfileStore {
         if (Files.size(source) > 32L * 1024 * 1024) throw new IOException("Profile file exceeds 32 MiB.");
         try {
             Document document = GSON.fromJson(Files.readString(source, StandardCharsets.UTF_8), Document.class);
-            if (document == null || !Integer.valueOf(1).equals(document.schemaVersion) || document.profiles == null)
-                throw new IllegalArgumentException("Expected a profile file with schemaVersion 1 and a profiles array.");
+            if (document == null || document.schemaVersion == null || document.schemaVersion < 1 || document.schemaVersion > SCHEMA_VERSION || document.profiles == null)
+                throw new IllegalArgumentException("Expected a profile file with schemaVersion 1 or 2 and a profiles array.");
             Set<String> names = new HashSet<>(); List<SessionProfile> result = new ArrayList<>();
             for (ProfileData data : document.profiles) {
                 Objects.requireNonNull(data); Objects.requireNonNull(data.rules);
@@ -82,13 +100,35 @@ public final class ProfileStore {
                     rules.add(new SessionProfile.Rule(Objects.requireNonNull(r.variable), r.source, Objects.requireNonNull(r.selector),
                             Objects.requireNonNull(r.initial), r.destination, Objects.requireNonNull(r.target), Objects.requireNonNull(r.prefix)));
                 }
-                SessionProfile profile = new SessionProfile(Objects.requireNonNull(data.name), new URL(data.endpoint), new URL(data.scope),
+                List<ScopeRule> scope = document.schemaVersion == 1 ? migrateScope(data) : readScope(data);
+                SessionProfile profile = new SessionProfile(Objects.requireNonNull(data.name), new URL(data.endpoint), scope, data.burpScope,
                         Objects.requireNonNull(data.request), data.interval, rules, data.enabled, data.autoMatch, Objects.requireNonNull(data.protocol));
-                profile.configureWorkflow(data.loginRequest, data.loginEndpoint == null ? null : new URL(data.loginEndpoint), data.scopeRules);
+                profile.configureWorkflow(data.loginRequest, data.loginEndpoint == null ? null : new URL(data.loginEndpoint));
                 if (data.currentValues != null) profile.restoreValues(data.currentValues);
                 result.add(profile);
             }
             return result;
         } catch (RuntimeException ex) { throw new IOException("Invalid profile file: " + (ex.getMessage() == null ? "missing or invalid field" : ex.getMessage()), ex); }
+    }
+    private static List<ScopeRule> readScope(ProfileData data) throws java.net.MalformedURLException {
+        if (data.scope == null || !data.scope.isJsonArray()) throw new IllegalArgumentException("Expected a scope array.");
+        List<ScopeRule> scope = new ArrayList<>();
+        for (JsonElement element : data.scope.getAsJsonArray()) {
+            ScopeData d = Objects.requireNonNull(GSON.fromJson(element, ScopeData.class));
+            scope.add(new ScopeRule(Objects.requireNonNull(d.action), Objects.requireNonNull(d.match), new URL(Objects.requireNonNull(d.url))));
+        }
+        return scope;
+    }
+    /** Version 1: SUBTREE lines become prefix includes and EXACT lines exact includes; without lines, the scope URL is a prefix include. */
+    private static List<ScopeRule> migrateScope(ProfileData data) throws java.net.MalformedURLException {
+        if (data.scope == null || !data.scope.isJsonPrimitive()) throw new IllegalArgumentException("Expected a scope URL.");
+        List<ScopeRule> scope = new ArrayList<>();
+        for (String line : (data.scopeRules == null ? "" : data.scopeRules).split("\r?\n")) if (!line.isBlank()) {
+            if (!(line.startsWith("EXACT ") || line.startsWith("SUBTREE "))) throw new IllegalArgumentException("Invalid version 1 scope rule: " + line);
+            scope.add(new ScopeRule(ScopeRule.Action.INCLUDE, line.startsWith("EXACT ") ? ScopeRule.Match.EXACT : ScopeRule.Match.PREFIX,
+                    new URL(line.substring(line.indexOf(' ') + 1).trim())));
+        }
+        if (scope.isEmpty()) scope.add(ScopeRule.include(new URL(data.scope.getAsString())));
+        return scope;
     }
 }

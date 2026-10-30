@@ -80,7 +80,7 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
             for (int row = 0; row < rows.size(); row++) {
                 SessionProfile p = rows.get(row);
                 Object[] cells = {p.name, p.enabled, p.autoMatch ? "Scope" : "Marker",
-                        p.autoMatch ? (p.scopeRules.isBlank() ? "URLs under " + p.scope : p.scopeRules) : SessionProfiles.MARKER + ": " + p.name + " (within " + (p.scopeRules.isBlank() ? p.scope.toString() : p.scopeRules) + ")",
+                        p.autoMatch ? p.describeScope() : SessionProfiles.MARKER + ": " + p.name + " (within " + p.describeScope() + ")",
                         p.enabled ? p.status : "Inactive — " + p.status,
                         p.lastSuccess == null ? "Never" : p.lastSuccess.toString(), p.nextRenewal == null ? "—" : p.nextRenewal.toString()};
                 for (int column = 0; column < cells.length; column++)
@@ -166,18 +166,17 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
         // A login import must not become the renewal URL; only a refresh import replaces it.
         boolean refreshImport = imported != null && !loginImport;
         JTextField endpoint = new JTextField(refreshImport ? importedUrl : existing != null ? existing.endpoint.toString() : "https://example.test/refresh");
-        String defaultScope = imported == null ? "https://example.test/" : origin(extension.getCallbacks().getHelpers().analyzeRequest(imported).getUrl());
-        JTextField scope = new JTextField(existing == null ? defaultScope : existing.scope.toString());
+        // Prefilled URL for new scope rows: the imported request's origin, else the profile's first rule's origin.
+        String defaultScope = imported != null ? origin(extension.getCallbacks().getHelpers().analyzeRequest(imported).getUrl())
+                : existing != null && !existing.scope.isEmpty() ? origin(existing.scope.get(0).url) : "https://example.test/";
         JSpinner interval = new JSpinner(new SpinnerNumberModel(existing == null ? 300 : existing.interval, 5, 86400, 5));
         JComboBox<ReauthHttpClient.Protocol> protocol = new JComboBox<>(ReauthHttpClient.Protocol.values());
         protocol.setSelectedItem(existing == null ? ReauthHttpClient.Protocol.AUTO : existing.protocol);
         JComboBox<String> matchBy = new JComboBox<>(new String[]{"Scope", "Marker"});
         matchBy.setSelectedItem(existing != null && existing.autoMatch ? "Scope" : "Marker");
-        JLabel scopeLabel = new JLabel();
         JTextField marker = new JTextField(); marker.setEditable(false);
         Runnable updateRule = () -> {
             boolean byScope = "Scope".equals(matchBy.getSelectedItem());
-            scopeLabel.setText(byScope ? "Scope URL (requests to modify)" : "Allowed URLs (marker restriction)");
             marker.setText(SessionProfiles.MARKER + ": " + name.getText().trim());
             marker.setEnabled(!byScope);
         };
@@ -191,7 +190,6 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
         fields.add(new JLabel("Profile name (e.g. alice)")); fields.add(name);
         fields.add(new JLabel("Renewal URL (destination service)")); fields.add(endpoint);
         fields.add(new JLabel("Match requests by")); fields.add(matchBy);
-        fields.add(scopeLabel); fields.add(scope);
         fields.add(new JLabel("Required marker header")); fields.add(marker);
         fields.add(new JLabel("Renew every (seconds)")); fields.add(interval);
         fields.add(new JLabel("HTTP protocol")); fields.add(protocol);
@@ -209,12 +207,26 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
         JPanel loginSettings = new JPanel(new GridLayout(0, 1)); loginSettings.add(useLogin); loginSettings.add(new JLabel("Login destination URL:")); loginSettings.add(loginUrl);
         JPanel loginPanel = new JPanel(new BorderLayout()); loginPanel.add(loginSettings, BorderLayout.NORTH); loginPanel.add(loginEditor.getComponent(), BorderLayout.CENTER);
         loginUrl.setToolTipText("Login destination URL; uncheck Use login before refresh for refresh-only operation");
-        JTextArea scopeRules = new JTextArea(existing == null ? "" : existing.scopeRules, 5, 60);
-        JPanel scopesPanel = new JPanel(new BorderLayout());
-        scopesPanel.add(new JLabel("One EXACT url or SUBTREE url per line. Blank uses the scope URL above."), BorderLayout.NORTH);
-        scopesPanel.add(new JScrollPane(scopeRules), BorderLayout.CENTER);
+        DefaultTableModel scopeRows = new DefaultTableModel(new String[]{"Action", "Match", "URL"}, 0);
+        if (existing == null) scopeRows.addRow(new Object[]{ScopeRule.Action.INCLUDE, ScopeRule.Match.PREFIX, defaultScope});
+        else for (ScopeRule r : existing.scope) scopeRows.addRow(new Object[]{r.action, r.match, r.url.toString()});
+        JTable scopeTable = new JTable(scopeRows);
+        scopeTable.setRowHeight(25);
+        scopeTable.getColumnModel().getColumn(0).setCellEditor(new DefaultCellEditor(new JComboBox<>(ScopeRule.Action.values())));
+        scopeTable.getColumnModel().getColumn(1).setCellEditor(new DefaultCellEditor(new JComboBox<>(ScopeRule.Match.values())));
+        scopeTable.getColumnModel().getColumn(0).setMaxWidth(110); scopeTable.getColumnModel().getColumn(1).setMaxWidth(110);
+        JCheckBox burpScope = new JCheckBox("Also include Burp target scope", existing != null && existing.burpScope);
+        JPanel scopesPanel = new JPanel(new BorderLayout(5, 5));
+        scopesPanel.add(new JLabel("Scope mode modifies matching requests; Marker mode also requires a match. PREFIX includes the path and everything below it; EXACT the path only (queries are ignored). EXCLUDE rules win."), BorderLayout.NORTH);
+        scopesPanel.add(new JScrollPane(scopeTable), BorderLayout.CENTER);
+        JPanel scopeButtons = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        JButton addInclude = new JButton("Add include"); addInclude.addActionListener(e -> scopeRows.addRow(new Object[]{ScopeRule.Action.INCLUDE, ScopeRule.Match.PREFIX, defaultScope})); scopeButtons.add(addInclude);
+        JButton addExclude = new JButton("Add exclude"); addExclude.addActionListener(e -> scopeRows.addRow(new Object[]{ScopeRule.Action.EXCLUDE, ScopeRule.Match.PREFIX, defaultScope})); scopeButtons.add(addExclude);
+        JButton removeScope = new JButton("Remove row"); removeScope.addActionListener(e -> { if (scopeTable.getSelectedRow() >= 0) scopeRows.removeRow(scopeTable.getSelectedRow()); }); scopeButtons.add(removeScope);
+        scopeButtons.add(burpScope);
+        scopesPanel.add(scopeButtons, BorderLayout.SOUTH);
         JTabbedPane workflow = new JTabbedPane(); workflow.addTab("Refresh request", requestEditor.getComponent());
-        workflow.addTab("Login request (optional)", loginPanel); workflow.addTab("Scope rules", scopesPanel);
+        workflow.addTab("Login request (optional)", loginPanel); workflow.addTab("Scope", scopesPanel);
         if (loginImport) workflow.setSelectedComponent(loginPanel);
         DefaultTableModel rules = new DefaultTableModel(new String[]{"Variable", "Extract from", "Cookie / header / JSON path / regex", "Initial value", "Use in requests", "Destination name", "Value prefix"}, 0);
         if (existing != null) for (SessionProfile.Rule r : existing.rules) rules.addRow(new Object[]{r.variable, r.source, r.selector, r.initial, r.destination, r.target, r.prefix});
@@ -248,14 +260,22 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
             JButton save = new JButton(action); save.addActionListener(e -> {
                 try {
                     if (ruleTable.isEditing() && !ruleTable.getCellEditor().stopCellEditing()) return;
+                    if (scopeTable.isEditing() && !scopeTable.getCellEditor().stopCellEditing()) return;
+                    List<ScopeRule> scope = new ArrayList<>();
+                    for (int row = 0; row < scopeRows.getRowCount(); row++) {
+                        URL url;
+                        try { url = new URL(cell(scopeRows, row, 2).trim()); }
+                        catch (java.net.MalformedURLException invalid) { throw new IllegalArgumentException("Scope row " + (row + 1) + ": enter a full URL such as https://example.test/api"); }
+                        scope.add(new ScopeRule(ScopeRule.Action.valueOf(cell(scopeRows, row, 0)), ScopeRule.Match.valueOf(cell(scopeRows, row, 1)), url));
+                    }
                     List<SessionProfile.Rule> definitions = new ArrayList<>();
                     for (int row = 0; row < rules.getRowCount(); row++) definitions.add(new SessionProfile.Rule(
                             cell(rules, row, 0), SessionProfile.Source.valueOf(cell(rules, row, 1)), cell(rules, row, 2), cell(rules, row, 3),
                             SessionProfile.Destination.valueOf(cell(rules, row, 4)), cell(rules, row, 5), cell(rules, row, 6)));
-                    SessionProfile profile = new SessionProfile(name.getText().trim(), new URL(endpoint.getText().trim()), new URL(scope.getText().trim()),
+                    SessionProfile profile = new SessionProfile(name.getText().trim(), new URL(endpoint.getText().trim()), scope, burpScope.isSelected(),
                             extension.getCallbacks().getHelpers().bytesToString(requestEditor.getMessage()), ((Number) interval.getValue()).intValue(), definitions, existing != null && existing.enabled, "Scope".equals(matchBy.getSelectedItem()), (ReauthHttpClient.Protocol) protocol.getSelectedItem());
                     String login = useLogin.isSelected() ? extension.getCallbacks().getHelpers().bytesToString(loginEditor.getMessage()) : "";
-                    profile.configureWorkflow(login, loginUrl.getText().isBlank() ? null : new URL(loginUrl.getText().trim()), scopeRules.getText());
+                    profile.configureWorkflow(login, loginUrl.getText().isBlank() ? null : new URL(loginUrl.getText().trim()));
                     profiles.save(profile, existing == null ? null : existing.name);
                     if (action.equals("Save and test") && !profile.enabled) profiles.test(profile.name);
                     refresh(); dialog.dispose();

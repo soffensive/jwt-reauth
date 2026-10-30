@@ -193,7 +193,7 @@ public final class SessionProfiles implements IExtensionStateListener {
         List<SessionProfile> matches = new ArrayList<>();
         for (SessionProfile p : profiles) {
             boolean selected = p.autoMatch ? markers.isEmpty() : markers.size() == 1 && p.name.equals(markers.get(0));
-            if (p.enabled && p.matches(url) && selected) matches.add(p);
+            if (p.enabled && selected && p.matches(url, extension.getCallbacks()::isInScope)) matches.add(p);
         }
         if (matches.size() != 1) {
             if (!markers.isEmpty() || matches.size() > 1) {
@@ -204,7 +204,7 @@ public final class SessionProfiles implements IExtensionStateListener {
                     reason = named == null ? "Unknown profile; credentials not injected"
                             : !named.enabled ? "Profile disabled; credentials not injected"
                             : named.autoMatch ? "Profile uses Scope mode, not Marker mode; credentials not injected"
-                            : "Outside allowed URLs for marker; credentials not injected";
+                            : "Outside profile scope for marker; credentials not injected";
                 } else reason = "Ambiguous profiles: " + matches.stream().map(p -> p.name).collect(java.util.stream.Collectors.joining(", ")) + "; credentials not injected";
                 extension.getLogController().info("%s", reason);
                 recordRequest(String.join(", ", markers), url, reason, original, message);
