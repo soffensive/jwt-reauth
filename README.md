@@ -11,9 +11,9 @@ requests, response extraction, request debugging, and local profile files.
 ## Getting started
 
 Load the extension JAR through Burp's **Extensions → Installed → Add → Java**.
-To build from source, use Java 11 and Gradle 7.1: `gradle build`. The JAR is written
-to `releases/`; the build also runs the automated checks. This checkout does not
-include the wrapper JAR, so use an installed Gradle rather than `./gradlew`.
+To build from source, use JDK 17 or newer: `./gradlew build`. The wrapper downloads
+Gradle 9.8.2. The JAR targets Java 17, is written to `releases/`, and the build also
+runs the automated checks.
 
 1. In **Sessions**, click **New profile**, or right-click a captured request and
    choose **Send to JWT re-auth (create session profile)**.

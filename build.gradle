@@ -4,11 +4,16 @@ plugins {
     id 'java'
 }
 
-group 'com.nccgroup'
-version '1.0.1'
+group = 'com.nccgroup'
+version = '1.0.1'
 
 repositories {
     mavenCentral()
+}
+
+// Any JDK 17+ can run the build; the JAR targets Java 17, the oldest runtime Burp has bundled since 2023.
+tasks.withType(JavaCompile).configureEach {
+    options.release = 17
 }
 
 dependencies {
@@ -49,3 +54,5 @@ tasks.register('profileChecks', JavaExec) {
     systemProperty 'java.awt.headless', 'true'
 }
 check.dependsOn profileChecks
+// No test framework is used, and Gradle 9 fails a test task that discovers no tests.
+tasks.named('test') { enabled = false }
