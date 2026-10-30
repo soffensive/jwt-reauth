@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 /** Integration checks using a small Burp API double; no network requests are sent. */
 public final class SessionProfilesTest {
     private static final String RESPONSE = "HTTP/1.1 200 OK\r\nSet-Cookie: session=new-cookie; Path=/\r\nX-CSRF: csrf-value\r\n\r\n{\"data\":{\"access_token\":\"new-token\"},\"refresh_token\":\"rotated\"}";
+    private static final String NO_MATCH = "HTTP/1.1 200 OK\r\n\r\n{\"error\":\"expired\"}";
     public static void main(String[] args) throws Exception {
         workflow(); extraction(); routing(); concurrency(); protocols(); persistence(); debugHistory(); startup();
         System.out.println("Session profile extraction, routing, and concurrency tests passed");
@@ -86,6 +87,26 @@ public final class SessionProfilesTest {
                 } catch (Exception ex) { throw new AssertionError(ex); }
                 return visible.get();
             });
+            String longToken = "eyJ" + "a".repeat(3000);
+            SessionProfile longProfile = new SessionProfile("long", tokenProfile.endpoint, tokenProfile.scope, tokenProfile.request, 3600,
+                    Arrays.asList(new SessionProfile.Rule("token", SessionProfile.Source.JSON, "access_token", longToken, SessionProfile.Destination.HEADER, "Authorization", "Bearer "),
+                            new SessionProfile.Rule("refresh", SessionProfile.Source.JSON, "refresh_token", "r", SessionProfile.Destination.VARIABLE, "")), false, false);
+            extension.getSessionProfiles().save(longProfile, null);
+            await(() -> {
+                java.util.concurrent.atomic.AtomicBoolean wrapped = new java.util.concurrent.atomic.AtomicBoolean();
+                try {
+                    javax.swing.SwingUtilities.invokeAndWait(() -> fixture.listeners.stream()
+                            .filter(listener -> listener instanceof com.nccgroup.jwtreauth.ui.TokenValuesPanel).forEach(listener -> {
+                                java.awt.Component panel = (java.awt.Component)listener;
+                                panel.setSize(600, 400); relayout(panel); relayout(panel);
+                                javax.swing.JTextArea field = findText(panel, longToken);
+                                if (field != null) wrapped.set(field.getText().equals(longToken) && field.getWidth() > 0 && field.getWidth() <= 600
+                                        && field.getHeight() > 3 * field.getFontMetrics(field.getFont()).getHeight());
+                            }));
+                } catch (Exception ex) { throw new AssertionError(ex); }
+                return wrapped.get();
+            });
+            extension.getSessionProfiles().remove("long");
             javax.swing.JTable overview = findTable(extension.getSessionProfilesPanel());
             await(() -> {
                 java.util.concurrent.atomic.AtomicBoolean ready = new java.util.concurrent.atomic.AtomicBoolean();
@@ -133,6 +154,21 @@ public final class SessionProfilesTest {
         }
         return null;
     }
+    /** Headless components have no peer, so validate() is a no-op: drop cached sizes, then lay out top-down. */
+    private static void relayout(java.awt.Component component) {
+        component.invalidate();
+        if (component instanceof java.awt.Container) {
+            ((java.awt.Container)component).doLayout();
+            for (java.awt.Component child : ((java.awt.Container)component).getComponents()) relayout(child);
+        }
+    }
+    private static javax.swing.JTextArea findText(java.awt.Component component, String text) {
+        if (component instanceof javax.swing.JTextArea && ((javax.swing.JTextArea)component).getText().equals(text)) return (javax.swing.JTextArea)component;
+        if (component instanceof java.awt.Container) for (java.awt.Component child : ((java.awt.Container)component).getComponents()) {
+            javax.swing.JTextArea found = findText(child, text); if (found != null) return found;
+        }
+        return null;
+    }
     private static boolean hasText(java.awt.Component component, String expected) {
         if (component instanceof javax.swing.JTextArea && ((javax.swing.JTextArea)component).getText().contains(expected)) return true;
         if (component instanceof java.awt.Container) for (java.awt.Component child : ((java.awt.Container)component).getComponents())
@@ -164,6 +200,31 @@ public final class SessionProfilesTest {
             java.time.Instant first = p.lastSuccess;
             await(() -> { manager.test(p.name); return !p.lastSuccess.equals(first); });
             assert f.sentRequests.stream().anyMatch(r -> r.startsWith("POST /refresh") && r.endsWith("refresh=rotated"));
+            f.responseText = NO_MATCH;
+            await(() -> { if (!p.status.startsWith("Failed")) manager.test(p.name); return p.status.startsWith("Failed"); });
+            assert p.status.contains("next attempt logs in");
+            f.responseText = RESPONSE; f.sentRequests.clear();
+            java.time.Instant failedAfter = p.lastSuccess;
+            await(() -> { manager.test(p.name); return !p.lastSuccess.equals(failedAfter); });
+            assert f.sentRequests.peek().startsWith("POST /login") : "A failed refresh must fall back to login";
+            f.sentRequests.clear(); java.time.Instant relogged = p.lastSuccess;
+            await(() -> { manager.test(p.name); return !p.lastSuccess.equals(relogged); });
+            assert f.sentRequests.peek().startsWith("POST /refresh") : "After a successful login, refresh resumes";
+            manager.setEnabled(p.name, true);
+            IHttpRequestResponse ownLogin = f.message("POST /login HTTP/1.1\r\nHost: example.test\r\nX-Reauth-Profile: workflow\r\n\r\nuser=alice");
+            assert manager.process(true, ownLogin);
+            assert !string(ownLogin.getRequest()).contains("Authorization:") : "Login requests must bypass injection";
+            assert !manager.getDebugLog().snapshot().stream().anyMatch(e -> e.kind.equals("Routing")) : "Unmatched traffic is not logged by default";
+            assert !manager.process(true, f.message("GET /elsewhere HTTP/1.1\r\nHost: example.test\r\n\r\n"));
+            assert !manager.getDebugLog().snapshot().stream().anyMatch(e -> e.kind.equals("Routing"));
+            manager.setLogUnmatched(true);
+            assert !manager.process(true, f.message("GET /elsewhere HTTP/1.1\r\nHost: example.test\r\n\r\n"));
+            assert latest(manager).kind.equals("Routing");
+            try {
+                profile("placeholder", false, false).configureWorkflow("POST /login HTTP/1.1\r\nHost: example.test\r\n\r\nuser=${missing}",
+                        new URL("https://example.test/login"), "");
+                throw new AssertionError("Unknown login placeholder accepted");
+            } catch (IllegalArgumentException expected) { assert expected.getMessage().contains("missing"); }
             ProfileStore.save(file, Arrays.asList(p));
             SessionProfile restored = ProfileStore.load(file).get(0);
             assert restored.loginRequest.equals(p.loginRequest) && restored.loginEndpoint.equals(p.loginEndpoint);
@@ -175,9 +236,16 @@ public final class SessionProfilesTest {
         alice.accept(RESPONSE);
         assert alice.render().endsWith("refresh=rotated");
         assert bob.render().endsWith("refresh=seed-bob");
+        bob.accept(RESPONSE.replace("refresh_token", "missing").replace("new-token", "partial-token"));
+        assert bob.snapshot().get("token").equals("partial-token") && bob.snapshot().get("refresh").equals("seed-bob")
+                : "A response without a rule's field keeps that value (non-rotating refresh tokens, login vs refresh fields)";
         Map<String, String> before = alice.snapshot();
-        try { alice.accept(RESPONSE.replace("refresh_token", "missing")); throw new AssertionError(); }
+        try { alice.accept(NO_MATCH); throw new AssertionError(); }
         catch (IllegalArgumentException expected) { assert alice.snapshot() == before; }
+        try { alice.accept(RESPONSE.replace("rotated", "a\\r\\nX-Injected: 1")); throw new AssertionError("CR/LF variable accepted"); }
+        catch (IllegalArgumentException expected) { assert alice.snapshot() == before : "Unsafe values must not be rendered into renewals"; }
+        assert !alice.matches(new URL("https://example.test/api/../admin"));
+        assert !alice.matches(new URL("https://example.test/api/%2E%2e/admin"));
         assert new SessionProfile.Rule("csrf", SessionProfile.Source.HEADER, "x-csrf", "", SessionProfile.Destination.VARIABLE, "").extract(RESPONSE).equals("csrf-value");
         assert new SessionProfile.Rule("refresh", SessionProfile.Source.REGEX, "\"refresh_token\":\"([^\"]+)\"", "", SessionProfile.Destination.VARIABLE, "").extract(RESPONSE).equals("rotated");
         assert alice.matches(new URL("https://example.test/api/users"));
@@ -191,7 +259,7 @@ public final class SessionProfilesTest {
             profiles.save(alice, null); profiles.save(bob, null);
             await(() -> alice.lastSuccess != null && bob.lastSuccess != null);
             Map<String, String> successful = alice.snapshot();
-            f.responseText = RESPONSE.replace("refresh_token", "missing");
+            f.responseText = NO_MATCH;
             // Publication can precede release of the renewal lock. Retry submission
             // until the failure check runs rather than assuming the worker is idle.
             await(() -> {

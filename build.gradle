@@ -15,7 +15,8 @@ dependencies {
     compileOnly 'net.portswigger.burp.extender:burp-extender-api:2.3'
     implementation 'com.google.code.gson:gson:2.10.1'
     testImplementation 'net.portswigger.burp.extender:burp-extender-api:2.3'
-    implementation 'javax.validation:validation-api:2.0.1.Final'
+    // Only @NotNull documentation annotations are used; missing annotations are ignored at runtime.
+    compileOnly 'javax.validation:validation-api:2.0.1.Final'
 }
 
 sourceSets {

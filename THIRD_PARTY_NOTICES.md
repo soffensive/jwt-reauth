@@ -1,9 +1,8 @@
 # Third-party notices
 
-The release JAR includes the following unmodified runtime libraries. They remain
-subject to their respective copyright notices and licenses. A copy of each
-release's full license text is provided below and packaged in the JAR under
-`META-INF/licenses/`.
+The release JAR includes the following unmodified runtime library. It remains
+subject to its copyright notice and license. Its full license text is referenced
+below and packaged in the JAR under `META-INF/licenses/`.
 
 ## Gson 2.10.1
 
@@ -14,22 +13,14 @@ release's full license text is provided below and packaged in the JAR under
 - Local license text: `licenses/gson-2.10.1-LICENSE.txt`
 - License source: https://github.com/google/gson/blob/gson-parent-2.10.1/LICENSE
 
-## Bean Validation API 2.0.1.Final
-
-- Maven coordinate: `javax.validation:validation-api:2.0.1.Final`
-- Project: https://github.com/beanvalidation/beanvalidation-api
-- Attribution: Bean Validation API contributors.
-- License: Apache License, Version 2.0.
-- Local license text: `licenses/validation-api-2.0.1.Final-LICENSE.txt`
-- License source: https://github.com/beanvalidation/beanvalidation-api/blob/2.0.1.Final/license.txt
-
-The dependency's `license.header` resource is also retained in the release JAR.
-
-## Burp Extender API
+## Compile-only dependencies
 
 `net.portswigger.burp.extender:burp-extender-api:2.3` is used only to compile and
 test the extension. It is not bundled in the release JAR; Burp Suite supplies the
 API at runtime.
+
+`javax.validation:validation-api:2.0.1.Final` (Apache License, Version 2.0) is used
+only at compile time for `@NotNull` annotations and is not bundled in the release JAR.
 
 ## Project license
 

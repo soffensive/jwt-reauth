@@ -45,6 +45,8 @@ public final class RequestDebugPanel extends JPanel implements IExtensionStateLi
     private final Timer timer;
     private List<RequestDebugLog.Event> rows = new ArrayList<>();
     private long revision = -1;
+    // Rebuilding the table clears its selection; without this guard the viewers would blank on every update.
+    private boolean rebuilding;
 
     public RequestDebugPanel(JWTReauth extension) {
         super(new BorderLayout(5, 5));
@@ -54,7 +56,9 @@ public final class RequestDebugPanel extends JPanel implements IExtensionStateLi
         after = extension.getCallbacks().createMessageEditor(afterContext, false);
         JPanel controls = new JPanel(new FlowLayout(FlowLayout.LEFT));
         JTextField search = new JTextField(25);
-        controls.add(new JLabel("Filter:")); controls.add(search); controls.add(follow);
+        JCheckBox unmatched = new JCheckBox("Log unmatched requests", false);
+        unmatched.addActionListener(e -> profiles.setLogUnmatched(unmatched.isSelected()));
+        controls.add(new JLabel("Filter:")); controls.add(search); controls.add(follow); controls.add(unmatched);
         JButton clear = new JButton("Clear history"); clear.addActionListener(e -> { log.clear(); refresh(); }); controls.add(clear);
         add(controls, BorderLayout.NORTH);
         TableRowSorter<DefaultTableModel> sorter = new TableRowSorter<>(model); table.setRowSorter(sorter);
@@ -65,7 +69,7 @@ public final class RequestDebugPanel extends JPanel implements IExtensionStateLi
             public void changedUpdate(DocumentEvent e) { update(); }
         });
         table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        table.getSelectionModel().addListSelectionListener(e -> { if (!e.getValueIsAdjusting()) showSelected(); });
+        table.getSelectionModel().addListSelectionListener(e -> { if (!e.getValueIsAdjusting() && !rebuilding) showSelected(); });
         JSplitPane comparison = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, labeled(leftLabel, before.getComponent()), labeled(rightLabel, after.getComponent()));
         comparison.setResizeWeight(.5);
         inspection.addTab("Request before / after", comparison);
@@ -121,14 +125,18 @@ public final class RequestDebugPanel extends JPanel implements IExtensionStateLi
         long latest = log.revision(); if (latest == revision) return;
         long selectedId = -1;
         if (table.getSelectedRow() >= 0) selectedId = rows.get(table.convertRowIndexToModel(table.getSelectedRow())).id;
-        rows = log.snapshot(); revision = latest; model.setRowCount(0);
-        for (RequestDebugLog.Event event : rows) model.addRow(new Object[]{event.time, event.kind, event.profile, event.url, event.kind.equals("Renewal") ? "—" : event.changed ? "Yes" : "No", event.reason});
         int target = -1;
-        for (int i = 0; i < rows.size(); i++) if (follow.isSelected() || rows.get(i).id == selectedId) {
-            int view = table.convertRowIndexToView(i); if (view >= 0) target = view;
-        }
-        if (target >= 0) { table.setRowSelectionInterval(target, target); if (follow.isSelected()) table.scrollRectToVisible(table.getCellRect(target, 0, true)); }
-        else showSelected();
+        rebuilding = true;
+        try {
+            rows = log.snapshot(); revision = latest; model.setRowCount(0);
+            for (RequestDebugLog.Event event : rows) model.addRow(new Object[]{event.time, event.kind, event.profile, event.url, event.kind.equals("Renewal") ? "—" : event.changed ? "Yes" : "No", event.reason});
+            for (int i = 0; i < rows.size(); i++) if (follow.isSelected() || rows.get(i).id == selectedId) {
+                int view = table.convertRowIndexToView(i); if (view >= 0) target = view;
+            }
+            if (target >= 0) table.setRowSelectionInterval(target, target);
+        } finally { rebuilding = false; }
+        if (target >= 0 && follow.isSelected()) table.scrollRectToVisible(table.getCellRect(target, 0, true));
+        showSelected();
     }
     @Override public void extensionUnloaded() { SwingUtilities.invokeLater(timer::stop); }
 }

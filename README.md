@@ -59,12 +59,13 @@ Profiles renew independently, without overlapping their own requests.
 
 ## Selecting requests to modify
 
-Each profile uses one mode, shown in the overview's **Match by** and **Requests
-modified** columns:
+Each profile uses one mode, shown in the overview's **Match by** and **Applies
+to** columns:
 
 - **Scope:** modifies unmarked requests under the configured scope URL. Matching
   includes scheme, host, port, and path subtree: `/api` includes `/api/users`,
-  but not `/apievil`. Exactly one active Scope profile must match.
+  but not `/apievil`. Paths with `.` or `..` segments (including `%2e`) never
+  match. Exactly one active Scope profile must match.
 - **Marker:** modifies requests containing the profile's marker, for example
   `X-Reauth-Profile: alice`. Requests must also fall within its **Allowed URLs**.
   The overview shows both the marker and this URL restriction.
@@ -76,9 +77,12 @@ Accounts are not inferred from existing browser cookies.
 ## Debugging
 
 The **Tokens** tab shows current tokens and variables for all profiles in plain
-text. It updates independently of debug history.
+text. Long values wrap instead of scrolling. **Copy value** copies the raw value;
+**Copy header** / **Copy cookie** copy it as sent, for example
+`Authorization: Bearer …`. It updates independently of debug history.
 
-The **Debugging** tab shows routing decisions and request changes. Ordinary
+The **Debugging** tab shows routing decisions and request changes. Requests no
+profile matches are recorded only when **Log unmatched requests** is checked. Ordinary
 requests use Burp's standard before/after viewers; renewal events show the renewal
 request and response instead, including failed responses. Select an event to
 inspect its exchange and details.
@@ -116,9 +120,14 @@ on the login tab with its URL and request populated. Alternatively, check
 **Use login before refresh** and enter the URL and request manually. Click
 **Save and test** to test the workflow. To bootstrap a session:
 login runs until it succeeds, then subsequent renewals use the refresh request.
-Both steps use the profile's extraction rules and protocol selection. Leave the
-login request blank for refresh-only operation. Imported profiles run login again
-when configured. There is no automatic fallback to login after refresh failure.
+Both steps use the profile's extraction rules and protocol selection. A rule
+whose value is absent from a response keeps its previous value, so login and
+refresh responses may carry different fields; a step fails only when no rule
+matches. Values containing line breaks are rejected. Leave the login request
+blank for refresh-only operation. Imported profiles run login again when
+configured. If a refresh fails, the next attempt runs login again, then refresh
+resumes after it succeeds. Requests to the login URL never receive injected
+credentials.
 
 Scope rules accept one `EXACT https://example.test/path` or
 `SUBTREE https://example.test/path` per line. Rules are combined with OR; exact

@@ -28,11 +28,12 @@ import javax.swing.filechooser.FileNameExtensionFilter;
 public final class SessionProfilesPanel extends JPanel implements IExtensionStateListener {
     private final JWTReauth extension;
     private final SessionProfiles profiles;
-    private final DefaultTableModel model = new DefaultTableModel(new String[]{"Profile", "Active", "Match by", "Requests modified", "Status", "Last success", "Next renewal"}, 0) {
+    private boolean refreshing;
+    private final DefaultTableModel model = new DefaultTableModel(new String[]{"Profile", "Active", "Match by", "Applies to", "Status", "Last success", "Next renewal"}, 0) {
         @Override public Class<?> getColumnClass(int column) { return column == 1 ? Boolean.class : String.class; }
         @Override public boolean isCellEditable(int row, int column) { return column == 1; }
         @Override public void setValueAt(Object value, int row, int column) {
-            if (column == 1 && row >= 0 && row < rows.size()) profiles.setEnabled(rows.get(row).name, Boolean.TRUE.equals(value));
+            if (!refreshing && column == 1 && row >= 0 && row < rows.size()) profiles.setEnabled(rows.get(row).name, Boolean.TRUE.equals(value));
             super.setValueAt(value, row, column);
         }
     };
@@ -69,15 +70,25 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
     private SessionProfile selected() {
         int row = table.getSelectedRow(); return row >= 0 && row < rows.size() ? rows.get(row) : null;
     }
+    /** Updates only changed cells so selection, editing, and tooltips survive the periodic refresh. */
     private void refresh() {
-        SessionProfile selected = selected(); rows = profiles.list(); model.setRowCount(0);
-        for (SessionProfile p : rows) {
-            model.addRow(new Object[]{p.name, p.enabled, p.autoMatch ? "Scope" : "Marker",
-                    p.autoMatch ? (p.scopeRules.isBlank() ? "URLs under " + p.scope : p.scopeRules) : SessionProfiles.MARKER + ": " + p.name + " (within " + (p.scopeRules.isBlank() ? p.scope.toString() : p.scopeRules) + ")",
-                    p.enabled ? p.status : "Inactive — " + p.status,
-                    p.lastSuccess == null ? "Never" : p.lastSuccess.toString(), p.nextRenewal == null ? "—" : p.nextRenewal.toString()});
-            if (selected != null && selected.name.equals(p.name)) table.setRowSelectionInterval(model.getRowCount() - 1, model.getRowCount() - 1);
-        }
+        if (table.isEditing()) return;
+        SessionProfile selected = selected(); rows = profiles.list();
+        refreshing = true;
+        try {
+            if (model.getRowCount() != rows.size()) model.setRowCount(rows.size());
+            for (int row = 0; row < rows.size(); row++) {
+                SessionProfile p = rows.get(row);
+                Object[] cells = {p.name, p.enabled, p.autoMatch ? "Scope" : "Marker",
+                        p.autoMatch ? (p.scopeRules.isBlank() ? "URLs under " + p.scope : p.scopeRules) : SessionProfiles.MARKER + ": " + p.name + " (within " + (p.scopeRules.isBlank() ? p.scope.toString() : p.scopeRules) + ")",
+                        p.enabled ? p.status : "Inactive — " + p.status,
+                        p.lastSuccess == null ? "Never" : p.lastSuccess.toString(), p.nextRenewal == null ? "—" : p.nextRenewal.toString()};
+                for (int column = 0; column < cells.length; column++)
+                    if (!java.util.Objects.equals(model.getValueAt(row, column), cells[column])) model.setValueAt(cells[column], row, column);
+            }
+        } finally { refreshing = false; }
+        int index = selected == null ? -1 : rows.stream().map(p -> p.name).collect(java.util.stream.Collectors.toList()).indexOf(selected.name);
+        if (index >= 0 && table.getSelectedRow() != index) table.setRowSelectionInterval(index, index);
     }
     private JFileChooser chooser() {
         JFileChooser chooser = new JFileChooser();
@@ -152,7 +163,9 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
         JPanel fields = new JPanel(new GridLayout(0, 2, 6, 6));
         JTextField name = new JTextField(existing == null ? "" : existing.name);
         String importedUrl = imported == null ? "https://example.test/refresh" : extension.getCallbacks().getHelpers().analyzeRequest(imported).getUrl().toString();
-        JTextField endpoint = new JTextField(existing == null || imported != null && !loginImport ? importedUrl : existing.endpoint.toString());
+        // A login import must not become the renewal URL; only a refresh import replaces it.
+        boolean refreshImport = imported != null && !loginImport;
+        JTextField endpoint = new JTextField(refreshImport ? importedUrl : existing != null ? existing.endpoint.toString() : "https://example.test/refresh");
         String defaultScope = imported == null ? "https://example.test/" : origin(extension.getCallbacks().getHelpers().analyzeRequest(imported).getUrl());
         JTextField scope = new JTextField(existing == null ? defaultScope : existing.scope.toString());
         JSpinner interval = new JSpinner(new SpinnerNumberModel(existing == null ? 300 : existing.interval, 5, 86400, 5));

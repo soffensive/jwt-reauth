@@ -112,40 +112,51 @@ public final class SessionProfile {
                 throw new IllegalArgumentException("Duplicate destination: " + rule.target);
         }
         values = Collections.unmodifiableMap(initial);
-        Matcher m = PLACEHOLDER.matcher(this.request);
-        while (m.find()) if (!initial.containsKey(m.group(1))) throw new IllegalArgumentException("Unknown variable: " + m.group(1));
+        checkPlaceholders(this.request);
     }
-    public String loginRequest = "";
-    public URL loginEndpoint;
-    public String scopeRules = "";
+    private void checkPlaceholders(String template) {
+        Matcher m = PLACEHOLDER.matcher(template);
+        while (m.find()) if (!values.containsKey(m.group(1))) throw new IllegalArgumentException("Unknown variable: " + m.group(1));
+    }
+    private static final class ScopeRule {
+        final URL url;
+        final boolean exact;
+        ScopeRule(URL url, boolean exact) { this.url = url; this.exact = exact; }
+    }
+    // Set by configureWorkflow before SessionProfiles publishes the profile; never changed afterwards.
+    public volatile String loginRequest = "";
+    public volatile URL loginEndpoint;
+    public volatile String scopeRules = "";
+    private volatile List<ScopeRule> parsedScopes = Collections.emptyList();
     public void configureWorkflow(String login, URL loginUrl, String scopes) {
         login = login.replace("\r\n", "\n").replace("\n", "\r\n");
         if (!login.isBlank()) {
             ReauthHttpClient.validate(login);
+            checkPlaceholders(login);
             if (loginUrl == null || !(loginUrl.getProtocol().equals("https") || loginUrl.getProtocol().equals("http")))
                 throw new IllegalArgumentException("Login requires an HTTP(S) URL.");
         }
+        List<ScopeRule> parsed = new ArrayList<>();
         for (String rule : scopes.split("\r?\n")) if (!rule.isBlank()) {
             if (!(rule.startsWith("EXACT ") || rule.startsWith("SUBTREE "))) throw new IllegalArgumentException("Use EXACT url or SUBTREE url on each scope line.");
             try {
                 URL url = new URL(rule.substring(rule.indexOf(' ') + 1).trim());
-                if (!url.getProtocol().matches("https?")) throw new IllegalArgumentException("Scope must be HTTP(S).");
+                if (!url.getProtocol().matches("https?") || url.getHost().isEmpty()) throw new IllegalArgumentException("Scope must be an HTTP(S) URL with a host.");
+                parsed.add(new ScopeRule(url, rule.startsWith("EXACT ")));
             } catch (java.net.MalformedURLException ex) { throw new IllegalArgumentException("Invalid scope URL."); }
         }
         loginRequest = login; loginEndpoint = loginUrl; scopeRules = scopes;
+        parsedScopes = Collections.unmodifiableList(parsed);
     }
     public boolean matches(URL url) {
-        if (scopeRules.isBlank()) return matchScope(scope, url, false);
-        for (String rule : scopeRules.split("\r?\n")) if (!rule.isBlank()) {
-            try {
-                if (matchScope(new URL(rule.substring(rule.indexOf(' ') + 1).trim()), url, rule.startsWith("EXACT "))) return true;
-            } catch (java.net.MalformedURLException impossible) { throw new IllegalStateException(impossible); }
-        }
+        List<ScopeRule> rules = parsedScopes;
+        if (rules.isEmpty()) return matchScope(scope, url, false);
+        for (ScopeRule rule : rules) if (matchScope(rule.url, url, rule.exact)) return true;
         return false;
     }
     private static boolean matchScope(URL scope, URL url, boolean exact) {
         String path = scope.getPath().isEmpty() ? "/" : scope.getPath();
-        if (!sameOrigin(scope, url)) return false;
+        if (!sameOrigin(scope, url) || hasDotSegment(url.getPath())) return false;
         if (exact) return path.equals(url.getPath().isEmpty() ? "/" : url.getPath()) && Objects.equals(scope.getQuery(), url.getQuery());
         return url.getPath().equals(path) || url.getPath().startsWith(path.endsWith("/") ? path : path + "/");
     }
@@ -153,17 +164,25 @@ public final class SessionProfile {
         return a.getProtocol().equalsIgnoreCase(b.getProtocol()) && a.getHost().equalsIgnoreCase(b.getHost())
                 && port(a) == port(b);
     }
+    /** Servers resolve "." and ".." (also percent-encoded), so such paths could escape a prefix match. */
+    private static boolean hasDotSegment(String path) {
+        for (String segment : path.split("/", -1)) {
+            String decoded = segment.replaceAll("(?i)%2e", ".");
+            if (decoded.equals(".") || decoded.equals("..")) return true;
+        }
+        return false;
+    }
     public static int port(URL url) { return url.getPort() < 0 ? url.getDefaultPort() : url.getPort(); }
+    private static boolean unsafeValue(Rule rule, String value) {
+        // Variables are rendered into renewal requests, so CR/LF is unsafe for every destination.
+        return value.contains("\r") || value.contains("\n") || (rule.destination == Destination.COOKIE && value.contains(";"));
+    }
     public Map<String, String> snapshot() { return values; }
     void restoreValues(Map<String, String> saved) {
         if (!saved.keySet().equals(values.keySet()) || saved.values().stream().anyMatch(Objects::isNull))
             throw new IllegalArgumentException("Saved variables must match the extraction rules.");
-        for (Rule rule : rules) {
-            String value = saved.get(rule.variable);
-            if (rule.destination != Destination.VARIABLE && (value.contains("\r") || value.contains("\n") ||
-                    (rule.destination == Destination.COOKIE && value.contains(";"))))
-                throw new IllegalArgumentException("Invalid saved value: " + rule.variable);
-        }
+        for (Rule rule : rules)
+            if (unsafeValue(rule, saved.get(rule.variable))) throw new IllegalArgumentException("Invalid saved value: " + rule.variable);
         values = Collections.unmodifiableMap(new LinkedHashMap<>(saved));
         status = "Ready — loaded values; renewal required";
     }
@@ -184,16 +203,20 @@ public final class SessionProfile {
         while (m.find()) m.appendReplacement(out, Matcher.quoteReplacement(snapshot.get(m.group(1))));
         m.appendTail(out); return out.toString();
     }
+    /**
+     * Login and refresh responses often carry different fields, so a rule without a match keeps its
+     * previous value. A response that matches no rule, or yields an unsafe value, changes nothing.
+     */
     public void accept(String response) {
         Map<String, String> updated = new LinkedHashMap<>(values);
+        boolean found = rules.isEmpty();
         for (Rule rule : rules) {
             String value = rule.extract(response);
-            if (value == null) throw new IllegalArgumentException("Missing response value: " + rule.variable);
-            if (rule.destination != Destination.VARIABLE && (value.contains("\r") || value.contains("\n") ||
-                    (rule.destination == Destination.COOKIE && value.contains(";"))))
-                throw new IllegalArgumentException("Invalid value for destination: " + rule.variable);
-            updated.put(rule.variable, value);
+            if (value == null) continue;
+            if (unsafeValue(rule, value)) throw new IllegalArgumentException("Invalid value for destination: " + rule.variable);
+            updated.put(rule.variable, value); found = true;
         }
+        if (!found) throw new IllegalArgumentException("Missing response value: no extraction rule matched");
         values = Collections.unmodifiableMap(updated);
     }
 }

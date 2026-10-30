@@ -34,9 +34,14 @@ public final class SessionProfiles implements IExtensionStateListener {
     private final RequestDebugLog debugLog = new RequestDebugLog();
     public RequestDebugLog getDebugLog() { return debugLog; }
     private final ConcurrentHashMap<String, Integer> inFlight = new ConcurrentHashMap<>();
+    private volatile boolean logUnmatched;
+    /** Unmatched traffic is not recorded by default so browsing cannot push renewals out of the history. */
+    public void setLogUnmatched(boolean enabled) { logUnmatched = enabled; }
     private static final class Entry {
         final SessionProfile profile;
         final AtomicBoolean busy = new AtomicBoolean();
+        /** Set after a failed refresh so the next attempt logs in again, if a login request exists. */
+        volatile boolean loginNext;
         ScheduledFuture<?> schedule;
         Entry(SessionProfile profile) { this.profile = profile; }
     }
@@ -104,9 +109,9 @@ public final class SessionProfiles implements IExtensionStateListener {
         String flightKey = null, targetKey = null;
         String requestText = "", responseText = "", exchangeUrl = profile.endpoint.toString();
         Map<String, String> previousValues = profile.snapshot();
+        boolean login = !profile.loginRequest.isBlank() && (profile.lastSuccess == null || entry.loginNext);
         try {
             renewing.set(true);
-            boolean login = profile.lastSuccess == null && !profile.loginRequest.isBlank();
             URL destination = login ? profile.loginEndpoint : profile.endpoint;
             exchangeUrl = destination.toString();
             byte[] raw = helpers.stringToBytes(login ? profile.render(profile.loginRequest) : profile.render());
@@ -123,25 +128,31 @@ public final class SessionProfiles implements IExtensionStateListener {
             responseText = helpers.bytesToString(response);
             int status = helpers.analyzeResponse(response).getStatusCode();
             if (status < 200 || status >= 300) throw new IllegalArgumentException("HTTP " + status);
-            if (!active(entry)) {
-                debugLog.addRenewal(profile.name, exchangeUrl, "Discarded result: profile deleted or replaced", requestText, responseText, "Profile no longer active.");
-                return;
+            // Publish under the registry lock: an edit either inherits these values or discards them, never a stale mix.
+            synchronized (this) {
+                if (!active(entry)) {
+                    debugLog.addRenewal(profile.name, exchangeUrl, "Discarded result: profile deleted or replaced", requestText, responseText, "Profile no longer active.");
+                    return;
+                }
+                profile.accept(responseText);
             }
-            Map<String, String> before = profile.snapshot();
-            profile.accept(responseText);
             List<String> results = new ArrayList<>();
-            profile.snapshot().forEach((name, value) -> results.add(name + (Objects.equals(before.get(name), value) ? " unchanged" : " updated")));
+            profile.snapshot().forEach((name, value) -> results.add(name + (Objects.equals(previousValues.get(name), value) ? " unchanged" : " updated")));
+            entry.loginNext = false;
             profile.lastSuccess = Instant.now();
             profile.status = "Ready — " + String.join(", ", results);
             debugLog.addRenewal(profile.name, exchangeUrl, profile.status, requestText, responseText,
                     "Workflow step: " + (login ? "Login" : "Refresh") + "\nProtocol: " + prepared.description() + "\nPrevious variables: " + previousValues + "\nCurrent variables: " + profile.snapshot());
         } catch (RuntimeException ex) {
-            // Do not include exception messages from parsers or HTTP helpers: they may contain secrets.
+            // The status appears in the overview, so keep parser and HTTP helper messages (which may contain
+            // secrets) out of it. The debug log already shows requests and tokens in full, so it gets the exception.
+            boolean retryLogin = !login && !profile.loginRequest.isBlank();
+            if (retryLogin) entry.loginNext = true;
             profile.status = "Failed — " + (ex instanceof com.google.gson.JsonParseException ? "malformed JSON; previous values retained" : ex instanceof IllegalArgumentException && ex.getMessage() != null &&
                     (ex.getMessage().startsWith("Missing response value:") || ex.getMessage().startsWith("Invalid value for destination:") || ex.getMessage().startsWith("HTTP ") || ex.getMessage().equals("No HTTP response"))
-                    ? ex.getMessage() : "invalid response or request; previous values retained");
+                    ? ex.getMessage() : "invalid response or request; previous values retained") + (retryLogin ? "; next attempt logs in" : "");
             debugLog.addRenewal(profile.name, exchangeUrl, profile.status, requestText, responseText,
-                    "Retained variables: " + profile.snapshot() + "\n" + ex.toString() + "\nProtocol: " + profile.protocol);
+                    "Workflow step: " + (login ? "Login" : "Refresh") + "\nRetained variables: " + profile.snapshot() + "\n" + ex + "\nProtocol: " + profile.protocol);
         } finally {
             if (flightKey != null) inFlight.computeIfPresent(flightKey, (key, count) -> count == 1 ? null : count - 1);
             if (targetKey != null) inFlight.computeIfPresent(targetKey, (key, count) -> count == 1 ? null : count - 1);
@@ -174,8 +185,8 @@ public final class SessionProfiles implements IExtensionStateListener {
         URL url = info.getUrl();
         List<SessionProfile> profiles = list();
         if (renewing.get() || inFlight.containsKey(fingerprint(message.getHttpService(), message.getRequest()))
-                || inFlight.containsKey(targetFingerprint(message.getHttpService(), message.getRequest())) || profiles.stream().anyMatch(p -> SessionProfile.sameOrigin(p.endpoint, url)
-                && p.endpoint.getPath().equals(url.getPath()))) {
+                || inFlight.containsKey(targetFingerprint(message.getHttpService(), message.getRequest()))
+                || profiles.stream().anyMatch(p -> isEndpoint(p.endpoint, url) || isEndpoint(p.loginEndpoint, url))) {
             recordRequest("", url, "Renewal/authentication request: credential injection bypassed", original, message);
             return true;
         }
@@ -199,7 +210,7 @@ public final class SessionProfiles implements IExtensionStateListener {
                 recordRequest(String.join(", ", markers), url, reason, original, message);
                 return true;
             }
-            debugLog.add("Routing", "", url.toString(), "No enabled session profile matched; request unchanged",
+            if (logUnmatched) debugLog.add("Routing", "", url.toString(), "No enabled session profile matched; request unchanged",
                     helpers.bytesToString(original), helpers.bytesToString(message.getRequest()), "No enabled profile selected by marker or automatic scope matching.");
             return false;
         }
@@ -246,6 +257,9 @@ public final class SessionProfiles implements IExtensionStateListener {
         for (String header : newHeaders) changes.append("Added: ").append(header).append("\n");
         if (original.equals(updated)) changes.append("Request unchanged.\n");
         debugLog.add("Request", profile, url.toString(), reason, original, updated, changes.toString());
+    }
+    private static boolean isEndpoint(URL endpoint, URL url) {
+        return endpoint != null && SessionProfile.sameOrigin(endpoint, url) && endpoint.getPath().equals(url.getPath());
     }
     private String targetFingerprint(IHttpService service, byte[] request) {
         String[] line = helpers.bytesToString(request).split("\r\n", 2)[0].split(" ", 3);
