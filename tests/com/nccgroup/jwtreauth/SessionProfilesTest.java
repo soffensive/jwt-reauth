@@ -116,7 +116,7 @@ public final class SessionProfilesTest {
             });
             javax.swing.SwingUtilities.invokeAndWait(() -> {
                 assert overview.getColumnName(1).equals("Active");
-                assert overview.getValueAt(0, 2).equals("Marker");
+                assert overview.getValueAt(0, 2).equals("Marker + scope");
                 assert overview.getValueAt(0, 3).toString().contains("X-Reauth-Profile: visible");
                 assert overview.getValueAt(0, 3).toString().contains("https://example.test/api");
                 assert overview.getColumnClass(1) == Boolean.class;

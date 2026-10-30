@@ -17,8 +17,8 @@ runs the automated checks.
 
 1. In **Sessions**, click **New profile**, or right-click a captured request and
    choose **Send to JWT re-auth (create session profile)**.
-2. Set a name, renewal URL, interval, and **Match requests by**: **Scope** or
-   **Marker**. Edit the renewal request in Burp's HTTP editor and the requests to
+2. Set a name, renewal URL, interval, and **Modify requests**: **In scope (no
+   marker)** or **With marker, in scope**. Edit the renewal request in Burp's HTTP editor and the requests to
    modify in the **Scope** tab. The overview summarizes each profile's mode and scope.
 3. Add extractors, supply any initial values needed for the first renewal, and
    click **Save and test**.
@@ -67,6 +67,9 @@ to** columns:
 - **Marker:** modifies requests containing the profile's marker, for example
   `X-Reauth-Profile: alice`. Requests must also fall within the profile's scope.
   The overview shows both the marker and the scope.
+
+Scope rules apply in both modes; the mode only decides whether a marker is
+required.
 
 The **Scope** tab holds a table of rules, each with an action, a match type, and
 a URL:

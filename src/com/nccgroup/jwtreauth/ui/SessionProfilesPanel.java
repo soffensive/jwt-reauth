@@ -79,7 +79,7 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
             if (model.getRowCount() != rows.size()) model.setRowCount(rows.size());
             for (int row = 0; row < rows.size(); row++) {
                 SessionProfile p = rows.get(row);
-                Object[] cells = {p.name, p.enabled, p.autoMatch ? "Scope" : "Marker",
+                Object[] cells = {p.name, p.enabled, p.autoMatch ? "Scope" : "Marker + scope",
                         p.autoMatch ? p.describeScope() : SessionProfiles.MARKER + ": " + p.name + " (within " + p.describeScope() + ")",
                         p.enabled ? p.status : "Inactive — " + p.status,
                         p.lastSuccess == null ? "Never" : p.lastSuccess.toString(), p.nextRenewal == null ? "—" : p.nextRenewal.toString()};
@@ -172,11 +172,12 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
         JSpinner interval = new JSpinner(new SpinnerNumberModel(existing == null ? 300 : existing.interval, 5, 86400, 5));
         JComboBox<ReauthHttpClient.Protocol> protocol = new JComboBox<>(ReauthHttpClient.Protocol.values());
         protocol.setSelectedItem(existing == null ? ReauthHttpClient.Protocol.AUTO : existing.protocol);
-        JComboBox<String> matchBy = new JComboBox<>(new String[]{"Scope", "Marker"});
-        matchBy.setSelectedItem(existing != null && existing.autoMatch ? "Scope" : "Marker");
+        // Index 0 is Scope mode (autoMatch); both modes apply the Scope tab's rules.
+        JComboBox<String> matchBy = new JComboBox<>(new String[]{"In scope (no marker)", "With marker, in scope"});
+        matchBy.setSelectedIndex(existing != null && existing.autoMatch ? 0 : 1);
         JTextField marker = new JTextField(); marker.setEditable(false);
         Runnable updateRule = () -> {
-            boolean byScope = "Scope".equals(matchBy.getSelectedItem());
+            boolean byScope = matchBy.getSelectedIndex() == 0;
             marker.setText(SessionProfiles.MARKER + ": " + name.getText().trim());
             marker.setEnabled(!byScope);
         };
@@ -189,7 +190,7 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
         updateRule.run();
         fields.add(new JLabel("Profile name (e.g. alice)")); fields.add(name);
         fields.add(new JLabel("Renewal URL (destination service)")); fields.add(endpoint);
-        fields.add(new JLabel("Match requests by")); fields.add(matchBy);
+        fields.add(new JLabel("Modify requests")); fields.add(matchBy);
         fields.add(new JLabel("Required marker header")); fields.add(marker);
         fields.add(new JLabel("Renew every (seconds)")); fields.add(interval);
         fields.add(new JLabel("HTTP protocol")); fields.add(protocol);
@@ -217,7 +218,7 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
         scopeTable.getColumnModel().getColumn(0).setMaxWidth(110); scopeTable.getColumnModel().getColumn(1).setMaxWidth(110);
         JCheckBox burpScope = new JCheckBox("Also include Burp target scope", existing != null && existing.burpScope);
         JPanel scopesPanel = new JPanel(new BorderLayout(5, 5));
-        scopesPanel.add(new JLabel("Scope mode modifies matching requests; Marker mode also requires a match. PREFIX includes the path and everything below it; EXACT the path only (queries are ignored). EXCLUDE rules win."), BorderLayout.NORTH);
+        scopesPanel.add(new JLabel("Both modes use these rules: Scope mode modifies unmarked matching requests; Marker mode modifies marked requests that also match. PREFIX includes the path and everything below it; EXACT the path only (queries are ignored). EXCLUDE rules win."), BorderLayout.NORTH);
         scopesPanel.add(new JScrollPane(scopeTable), BorderLayout.CENTER);
         JPanel scopeButtons = new JPanel(new FlowLayout(FlowLayout.LEFT));
         JButton addInclude = new JButton("Add include"); addInclude.addActionListener(e -> scopeRows.addRow(new Object[]{ScopeRule.Action.INCLUDE, ScopeRule.Match.PREFIX, defaultScope})); scopeButtons.add(addInclude);
@@ -273,7 +274,7 @@ public final class SessionProfilesPanel extends JPanel implements IExtensionStat
                             cell(rules, row, 0), SessionProfile.Source.valueOf(cell(rules, row, 1)), cell(rules, row, 2), cell(rules, row, 3),
                             SessionProfile.Destination.valueOf(cell(rules, row, 4)), cell(rules, row, 5), cell(rules, row, 6)));
                     SessionProfile profile = new SessionProfile(name.getText().trim(), new URL(endpoint.getText().trim()), scope, burpScope.isSelected(),
-                            extension.getCallbacks().getHelpers().bytesToString(requestEditor.getMessage()), ((Number) interval.getValue()).intValue(), definitions, existing != null && existing.enabled, "Scope".equals(matchBy.getSelectedItem()), (ReauthHttpClient.Protocol) protocol.getSelectedItem());
+                            extension.getCallbacks().getHelpers().bytesToString(requestEditor.getMessage()), ((Number) interval.getValue()).intValue(), definitions, existing != null && existing.enabled, matchBy.getSelectedIndex() == 0, (ReauthHttpClient.Protocol) protocol.getSelectedItem());
                     String login = useLogin.isSelected() ? extension.getCallbacks().getHelpers().bytesToString(loginEditor.getMessage()) : "";
                     profile.configureWorkflow(login, loginUrl.getText().isBlank() ? null : new URL(loginUrl.getText().trim()));
                     profiles.save(profile, existing == null ? null : existing.name);
